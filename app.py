@@ -430,8 +430,48 @@ def render_preview_image(pdf_bytes, page_index, regions_for_page, dpi=100):
 # ============================================================
 # Output PDF composition (vector-quality crop via show_pdf_page)
 # ============================================================
+def _shelf_pack(regions, content_w, content_h, title_h, spacing, scale, title_fontsize=11):
+    """Greedy shelf (row) packing at a fixed uniform scale. Returns
+    (rows, total_height) where rows is a list of lists of
+    (region, scaled_w, scaled_h) in placement order. Each slot is widened
+    if needed so the title caption text isn't wider than the drawing."""
+    rows, cur_row, cur_row_w, cur_row_h = [], [], 0.0, 0.0
+    for r in regions:
+        rw, rh = r["X1"] - r["X0"], r["Y1"] - r["Y0"]
+        title_text = f"{r['Kind']}: {r['Title']}"
+        title_w = pymupdf.get_text_length(title_text, fontname="helv", fontsize=title_fontsize) + 4
+        sw = max(rw * scale, title_w)
+        sh = rh * scale + title_h
+        add_w = sw + (spacing if cur_row else 0)
+        if cur_row and (cur_row_w + add_w > content_w):
+            rows.append((cur_row_h, cur_row))
+            cur_row, cur_row_w, cur_row_h = [], 0.0, 0.0
+            add_w = sw
+        cur_row.append((r, sw, sh))
+        cur_row_w += add_w
+        cur_row_h = max(cur_row_h, sh)
+    if cur_row:
+        rows.append((cur_row_h, cur_row))
+    total_h = sum(rh for rh, _ in rows) + spacing * max(len(rows) - 1, 0)
+    return rows, total_h
+
+
+def _best_single_page_scale(regions, content_w, content_h, title_h, spacing, title_fontsize=11):
+    """Binary search the largest uniform scale at which every selected
+    region still fits on one page via shelf packing."""
+    lo, hi = 0.0005, 8.0
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        _, total_h = _shelf_pack(regions, content_w, content_h, title_h, spacing, mid, title_fontsize)
+        if total_h <= content_h:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
-                      margin=36, spacing=18, title_fontsize=11):
+                      margin=36, spacing=18, title_fontsize=11, single_page=True):
     w, h = PAPER_SIZES_PT[paper_key]
     if orientation == "Landscape":
         w, h = h, w
@@ -440,54 +480,76 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
     out = pymupdf.open()
     content_w = w - 2 * margin
     content_h = h - 2 * margin
-
-    page = out.new_page(width=w, height=h)
-    cursor_y = margin
     title_h = title_fontsize + 8
 
-    for r in selected_regions:
-        x0, y0, x1, y1 = r["X0"], r["Y0"], r["X1"], r["Y1"]
-        rw, rh = x1 - x0, y1 - y0
-        if rw <= 0 or rh <= 0:
-            continue
-        src_bbox = pymupdf.Rect(x0, y0, x1, y1)
+    valid_regions = [r for r in selected_regions if (r["X1"] - r["X0"]) > 0 and (r["Y1"] - r["Y0"]) > 0]
 
-        scale = content_w / rw
-        scaled_h = rh * scale
-        needed = title_h + scaled_h
-        if needed > content_h:
-            scale2 = (content_h - title_h) / rh
-            scale = min(scale, scale2)
-            scaled_h = rh * scale
-            needed = title_h + scaled_h
+    def _place(page, r, dest_rect, title_size):
+        page.insert_text((dest_rect.x0, dest_rect.y0 - 3),
+                          f"{r['Kind']}: {r['Title']}", fontsize=title_size, fontname="helv")
+        src_bbox = pymupdf.Rect(r["X0"], r["Y0"], r["X1"], r["Y1"])
+        try:
+            page.show_pdf_page(dest_rect, src, int(r["Page"]) - 1, clip=src_bbox)
+            page.draw_rect(dest_rect, color=(0.6, 0.6, 0.6), width=0.5)
+        except Exception:
+            pass
 
-        fits_full_size = (title_h + rh * (content_w / rw)) <= content_h + 1e-6
-        remaining = margin + content_h - cursor_y
-        if cursor_y > margin and (
-            needed > remaining or (fits_full_size and needed > remaining)
-        ):
-            page = out.new_page(width=w, height=h)
-            cursor_y = margin
-            # recompute scale fresh for the new page (in case it was shrunk to fit before)
+    if single_page:
+        # Squeeze every selected item onto a single sheet: binary-search a
+        # uniform scale small enough that a greedy row-pack of all items
+        # fits within one page, then lay them out at that scale.
+        scale = _best_single_page_scale(valid_regions, content_w, content_h, title_h, spacing)
+        rows, _ = _shelf_pack(valid_regions, content_w, content_h, title_h, spacing, scale)
+        page = out.new_page(width=w, height=h)
+        cursor_y = margin
+        for row_h, items in rows:
+            cursor_x = margin
+            for r, sw, sh in items:
+                title_top = cursor_y + title_h
+                drawing_w = (r["X1"] - r["X0"]) * scale
+                x_off = cursor_x + max((sw - drawing_w) / 2, 0)  # center drawing within its slot
+                dest_rect = pymupdf.Rect(x_off, title_top,
+                                          x_off + drawing_w, title_top + (sh - title_h))
+                page.insert_text((cursor_x, cursor_y + title_fontsize),
+                                  f"{r['Kind']}: {r['Title']}", fontsize=title_fontsize, fontname="helv")
+                src_bbox = pymupdf.Rect(r["X0"], r["Y0"], r["X1"], r["Y1"])
+                try:
+                    page.show_pdf_page(dest_rect, src, int(r["Page"]) - 1, clip=src_bbox)
+                    page.draw_rect(dest_rect, color=(0.6, 0.6, 0.6), width=0.5)
+                except Exception:
+                    pass
+                cursor_x += sw + spacing
+            cursor_y += row_h + spacing
+    else:
+        # Natural size, flowing onto as many pages as needed.
+        page = out.new_page(width=w, height=h)
+        cursor_y = margin
+        for r in valid_regions:
+            rw, rh = r["X1"] - r["X0"], r["Y1"] - r["Y0"]
+
             scale = content_w / rw
             scaled_h = rh * scale
             needed = title_h + scaled_h
             if needed > content_h:
-                scale2 = (content_h - title_h) / rh
-                scale = min(scale, scale2)
+                scale = min(scale, (content_h - title_h) / rh)
                 scaled_h = rh * scale
                 needed = title_h + scaled_h
 
-        page.insert_text((margin, cursor_y + title_fontsize),
-                          f"{r['Kind']}: {r['Title']}", fontsize=title_fontsize, fontname="helv")
-        top = cursor_y + title_h
-        dest_rect = pymupdf.Rect(margin, top, margin + rw * scale, top + scaled_h)
-        try:
-            page.show_pdf_page(dest_rect, src, int(r["Page"]) - 1, clip=src_bbox)
-        except Exception:
-            continue
-        page.draw_rect(dest_rect, color=(0.6, 0.6, 0.6), width=0.5)
-        cursor_y = top + scaled_h + spacing
+            remaining = margin + content_h - cursor_y
+            if cursor_y > margin and needed > remaining:
+                page = out.new_page(width=w, height=h)
+                cursor_y = margin
+                scale = content_w / rw
+                scaled_h = rh * scale
+                needed = title_h + scaled_h
+                if needed > content_h:
+                    scale = min(scale, (content_h - title_h) / rh)
+                    scaled_h = rh * scale
+
+            title_top = cursor_y + title_h
+            dest_rect = pymupdf.Rect(margin, title_top, margin + rw * scale, title_top + scaled_h)
+            _place(page, r, dest_rect, title_fontsize)
+            cursor_y = title_top + scaled_h + spacing
 
     buf = out.tobytes()
     out.close()
@@ -509,6 +571,16 @@ with st.sidebar:
     st.header("Output Settings")
     paper_key = st.selectbox("Paper size", list(PAPER_SIZES_PT.keys()))
     orientation = st.radio("Orientation", ["Portrait", "Landscape"], horizontal=True)
+    layout_mode = st.radio(
+        "Layout",
+        ["Squeeze onto one sheet", "Natural size (multiple sheets)"],
+        index=0,
+        help="'Squeeze onto one sheet' shrinks everything checked below, as "
+             "a group, to the largest uniform scale that still fits all of "
+             "it on a single page. 'Natural size' places each item at full "
+             "scale and flows onto additional pages as needed.",
+    )
+    single_page = layout_mode.startswith("Squeeze")
     with st.expander("Advanced layout"):
         margin = st.number_input("Margin (pt)", min_value=0, max_value=144, value=36, step=6)
         spacing = st.number_input("Spacing between items (pt)", min_value=0, max_value=72, value=18, step=6)
@@ -630,10 +702,17 @@ if st.session_state.pdf_bytes is not None:
                             st.session_state.pdf_bytes,
                             selected_sorted.to_dict("records"),
                             paper_key, orientation, margin=margin, spacing=spacing,
+                            single_page=single_page,
                         )
                         base = os.path.splitext(st.session_state.pdf_name or "sheet")[0]
-                        out_name = f"{base}_SELECTED_{paper_key.split(' ')[0]}_{orientation}.pdf"
-                        st.success("Done!")
+                        mode_tag = "ONEPAGE" if single_page else "MULTIPAGE"
+                        out_name = f"{base}_SELECTED_{paper_key.split(' ')[0]}_{orientation}_{mode_tag}.pdf"
+                        if single_page:
+                            n_out_pages = 1
+                        else:
+                            with pymupdf.open(stream=out_bytes, filetype="pdf") as _chk:
+                                n_out_pages = len(_chk)
+                        st.success(f"Done! ({n_out_pages} page{'s' if n_out_pages != 1 else ''})")
                         st.download_button(
                             "⬇️ Download Exported PDF", data=out_bytes,
                             file_name=out_name, mime="application/pdf",
