@@ -41,6 +41,30 @@ try:
 except Exception:
     HAS_CANVAS = False
 
+if HAS_CANVAS:
+    # streamlit-drawable-canvas (unmaintained since ~2022) calls the internal
+    # helper streamlit.elements.image.image_to_url(image, width, clamp,
+    # channels, output_format, image_id). Modern Streamlit moved that helper
+    # to streamlit.elements.lib.image_utils and changed its signature to take
+    # a LayoutConfig instead of a plain width, which raises an AttributeError
+    # on import. Patch a signature-compatible shim back onto the old location
+    # so the component still works; if some future Streamlit version breaks
+    # this shim too, just disable the canvas feature instead of crashing.
+    try:
+        import streamlit.elements.image as _st_image_mod
+        if not hasattr(_st_image_mod, "image_to_url"):
+            from streamlit.elements.lib.image_utils import image_to_url as _new_image_to_url
+            from streamlit.elements.lib.layout_utils import LayoutConfig as _LayoutConfig
+
+            def _image_to_url_shim(image, width, clamp, channels, output_format, image_id):
+                return _new_image_to_url(
+                    image, _LayoutConfig(width=width), clamp, channels, output_format, image_id
+                )
+
+            _st_image_mod.image_to_url = _image_to_url_shim
+    except Exception:
+        HAS_CANVAS = False
+
 # ============================================================
 # Local persistence (remembers checkbox selections + footer fields
 # per-PDF across app restarts, keyed by a hash of the file contents)
