@@ -698,25 +698,40 @@ def _group_by_sheet(regions):
     return [sheets[key] for key in order]
 
 
+def _dedupe_rows_by_name(rows):
+    """One representative row per distinct (Kind, Title) -- first occurrence
+    wins. Used to build a manual-layout *template* (one box per named
+    view/schedule) instead of one box per individual sheet, so the same
+    hand-arranged layout can be repeated across every sheet that has that
+    name rather than cramming every sheet's copy onto one page."""
+    seen = set()
+    out = []
+    for r in rows:
+        key = (r["Kind"], r["Title"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
                       margin=36, spacing=18, footer_fields=None,
                       manual_dest=None):
     """Each source sheet (input PDF page) is treated as its own project:
-    every sheet gets its own output page, squeezed to a uniform scale that
-    fits everything checked on it -- items from two different sheets are
-    never packed onto the same output page together. Every sheet keeps its
-    own Drawing Name / Drawing No in the footer (read fresh from that
+    every sheet gets its own output page -- items from two different sheets
+    are never packed onto the same output page together. Every sheet keeps
+    its own Drawing Name / Drawing No in the footer (read fresh from that
     sheet's own title block); only Project Name is shared across all pages,
     from footer_fields. All the resulting pages land in one combined PDF.
 
-    manual_dest, if given, is a list (same length/order as selected_regions)
-    of dicts {'x','y','w','h'} in PDF points on a single page -- this is the
-    exact placement the user dragged/resized in the layout editor for the
-    current full selection, and overrides the automatic squeeze/flow
-    packing entirely (it does not do the one-page-per-sheet grouping below,
-    since the layout editor works on one combined canvas, so its footer
-    falls back to the global Drawing Name/No in footer_fields since there's
-    no single source sheet to read them from)."""
+    manual_dest, if given, is {source_sheet_page: [(region_dict, dest_dict), ...]}
+    -- the exact per-view/schedule-name positions/sizes the user dragged and
+    resized in the layout editor, as a single template that's repeated as
+    its own output page for every sheet that has a region for that name
+    (selected_regions is ignored in this mode -- each sheet's own region
+    comes straight out of manual_dest instead). dest_dict is
+    {'x','y','w','h'} in PDF points on one output page."""
     w, h = PAPER_SIZES_PT[paper_key]
     if orientation == "Landscape":
         w, h = h, w
@@ -727,7 +742,6 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
     content_w = w - 2 * margin
     content_h = h - 2 * margin
 
-    valid_regions = [r for r in selected_regions if (r["X1"] - r["X0"]) > 0 and (r["Y1"] - r["Y0"]) > 0]
     # Track page *numbers* (and each one's source sheet), not the Page
     # objects themselves: PyMuPDF orphans earlier Page wrappers (parent
     # becomes None) as soon as another page is added to the document, so
@@ -735,7 +749,7 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
     # then drawing on it later raises "AttributeError: 'NoneType' object
     # has no attribute 'is_pdf'". Numbers stay valid; re-fetch each one
     # fresh via out[n] once everything is built.
-    all_pages = []  # list of (out_page_number, source_sheet_page_or_None)
+    all_pages = []  # list of (out_page_number, source_sheet_page)
 
     def _place(page, r, dest_rect):
         src_bbox = pymupdf.Rect(r["X0"], r["Y0"], r["X1"], r["Y1"])
@@ -745,16 +759,18 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
             pass
 
     if manual_dest is not None:
-        page = out.new_page(width=w, height=h)
-        all_pages.append((page.number, None))
-        for r, dest in zip(selected_regions, manual_dest):
-            if (r["X1"] - r["X0"]) <= 0 or (r["Y1"] - r["Y0"]) <= 0:
-                continue
-            if dest["w"] <= 0 or dest["h"] <= 0:
-                continue
-            dest_rect = pymupdf.Rect(dest["x"], dest["y"], dest["x"] + dest["w"], dest["y"] + dest["h"])
-            _place(page, r, dest_rect)
+        for sheet_page, pairs in manual_dest.items():
+            page = out.new_page(width=w, height=h)
+            all_pages.append((page.number, sheet_page))
+            for r, dest in pairs:
+                if (r["X1"] - r["X0"]) <= 0 or (r["Y1"] - r["Y0"]) <= 0:
+                    continue
+                if dest["w"] <= 0 or dest["h"] <= 0:
+                    continue
+                dest_rect = pymupdf.Rect(dest["x"], dest["y"], dest["x"] + dest["w"], dest["y"] + dest["h"])
+                _place(page, r, dest_rect)
     else:
+        valid_regions = [r for r in selected_regions if (r["X1"] - r["X0"]) > 0 and (r["Y1"] - r["Y0"]) > 0]
         for sheet_regions in _group_by_sheet(valid_regions):
             # Squeeze this sheet's items onto a single output page:
             # binary-search a uniform scale small enough that a greedy
@@ -1255,24 +1271,26 @@ if st.session_state.pdf_bytes is not None:
             selected_rows = selected_sorted.to_dict("records")
 
             manual_dest_list = None
-            manual_regions = None
             if manual_layout and not selected.empty:
                 st.subheader("Layout Editor")
                 st.caption(
-                    "Two ways to arrange things: drag an item to reposition it and drag a "
-                    "corner handle to resize it (hold Shift to keep proportions) -- or pick "
-                    "a column x row grid below and click Apply to auto-arrange, then still "
-                    f"fine-tune by dragging. This represents one {paper_key.split(' ')[0]} "
-                    f"{orientation.lower()} output page -- the light grey guide shows your margin."
+                    "Design the layout once, per named view/schedule -- drag an item to "
+                    "reposition it and drag a corner handle to resize it (hold Shift to keep "
+                    "proportions), or pick a column x row grid below and click Apply. This same "
+                    f"layout is then repeated as its own {paper_key.split(' ')[0]} "
+                    f"{orientation.lower()} output page for every sheet that has these items -- "
+                    "the light grey guide shows your margin."
                 )
 
                 page_w, page_h = PAPER_SIZES_PT[paper_key]
                 if orientation == "Landscape":
                     page_w, page_h = page_h, page_w
 
-                selection_key = tuple((r["Page"], r["Kind"], r["Title"]) for r in selected_rows)
+                template_rows = _dedupe_rows_by_name(selected_rows)
+
+                selection_key = tuple((r["Kind"], r["Title"]) for r in template_rows)
                 if st.session_state.canvas_selection_key != selection_key:
-                    initial, order = build_canvas_initial_layout(selected_rows, page_w, page_h, margin, spacing)
+                    initial, order = build_canvas_initial_layout(template_rows, page_w, page_h, margin, spacing)
                     st.session_state.canvas_initial = initial
                     st.session_state.canvas_region_order = order
                     st.session_state.canvas_selection_key = selection_key
@@ -1280,7 +1298,7 @@ if st.session_state.pdf_bytes is not None:
                 arrange_col1, arrange_col2, arrange_col3, arrange_col4 = st.columns([1.3, 0.8, 0.8, 1.1])
                 with arrange_col1:
                     if st.button("↺ Reset to auto-packed"):
-                        initial, order = build_canvas_initial_layout(selected_rows, page_w, page_h, margin, spacing)
+                        initial, order = build_canvas_initial_layout(template_rows, page_w, page_h, margin, spacing)
                         st.session_state.canvas_initial = initial
                         st.session_state.canvas_region_order = order
                 with arrange_col2:
@@ -1291,11 +1309,11 @@ if st.session_state.pdf_bytes is not None:
                     st.write("")  # vertical spacer to align button with the number inputs
                     if st.button(f"⊞ Apply {int(grid_cols)}x{int(grid_rows)} grid"):
                         initial, order = build_grid_initial_layout(
-                            selected_rows, page_w, page_h, margin, spacing, grid_cols, grid_rows)
+                            template_rows, page_w, page_h, margin, spacing, grid_cols, grid_rows)
                         st.session_state.canvas_initial = initial
                         st.session_state.canvas_region_order = order
-                        if len(selected_rows) > grid_cols * grid_rows:
-                            st.info(f"{len(selected_rows)} items don't fit a "
+                        if len(template_rows) > grid_cols * grid_rows:
+                            st.info(f"{len(template_rows)} named item(s) don't fit a "
                                     f"{int(grid_cols)}x{int(grid_rows)} grid -- added extra row(s) "
                                     "so nothing was left out.")
 
@@ -1325,11 +1343,6 @@ if st.session_state.pdf_bytes is not None:
                     objs = canvas_result.json_data.get("objects", [])
                     if len(objs) == len(st.session_state.canvas_region_order):
                         manual_dest_list = canvas_objects_to_dest(objs, page_w, page_h)
-                        manual_regions = [
-                            {"Page": o[0], "Kind": o[1], "Title": o[2],
-                             "X0": o[3], "Y0": o[4], "X1": o[5], "Y1": o[6]}
-                            for o in st.session_state.canvas_region_order
-                        ]
                     else:
                         st.warning("Layout editor is out of sync with the current selection -- "
                                    "click 'Reset layout to auto-packed' above.")
@@ -1344,10 +1357,29 @@ if st.session_state.pdf_bytes is not None:
                             "drawing_no": st.session_state.drawing_no.strip(),
                         }
                         if manual_layout and manual_dest_list is not None:
+                            # manual_dest_list has one dest rect per distinct
+                            # (Kind, Title) name, in canvas_region_order. Repeat
+                            # that same template as one output page per sheet,
+                            # each sheet contributing its own region for
+                            # whichever names it actually has.
+                            dest_by_name = {
+                                (o[1], o[2]): dest
+                                for o, dest in zip(st.session_state.canvas_region_order, manual_dest_list)
+                            }
+                            manual_dest_by_sheet = {}
+                            for sheet_regions in _group_by_sheet(selected_rows):
+                                sheet_page = int(sheet_regions[0]["Page"])
+                                pairs = [
+                                    (r, dest_by_name[(r["Kind"], r["Title"])])
+                                    for r in sheet_regions
+                                    if (r["Kind"], r["Title"]) in dest_by_name
+                                ]
+                                if pairs:
+                                    manual_dest_by_sheet[sheet_page] = pairs
                             out_bytes = build_output_pdf(
-                                st.session_state.pdf_bytes, manual_regions,
+                                st.session_state.pdf_bytes, None,
                                 paper_key, orientation, margin=margin, spacing=spacing,
-                                footer_fields=footer_fields, manual_dest=manual_dest_list,
+                                footer_fields=footer_fields, manual_dest=manual_dest_by_sheet,
                             )
                         else:
                             out_bytes = build_output_pdf(
