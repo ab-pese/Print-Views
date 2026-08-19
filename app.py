@@ -903,13 +903,78 @@ def canvas_objects_to_dest(json_objects, page_w, page_h):
 
 
 # ============================================================
+# Sheet grouping (treat sheets with the exact same set of
+# view/schedule names as one repeatable project)
+# ============================================================
+def _signature_key(signature):
+    """Stable string key for a (Kind, Title) signature, for cache storage."""
+    return "||".join(sorted(f"{k}:{t}" for k, t in signature))
+
+
+def group_sheets_by_signature(regions_df):
+    """Groups sheet page numbers by the exact set of (Kind, Title) detected
+    on them -- sheets with the identical set of view/schedule names are
+    the same "project" and get grouped together. Returns a list of group
+    dicts (largest group first), each: {"id", "key", "signature", "pages"}."""
+    by_page = {}
+    for _, row in regions_df.iterrows():
+        by_page.setdefault(int(row["Page"]), []).append((row["Kind"], row["Title"]))
+
+    sig_to_pages = {}
+    for page, items in by_page.items():
+        sig = frozenset(items)
+        sig_to_pages.setdefault(sig, []).append(page)
+
+    groups = [{"signature": sig, "pages": sorted(pages)} for sig, pages in sig_to_pages.items()]
+    groups.sort(key=lambda g: (-len(g["pages"]), sorted(g["signature"])))
+    for i, g in enumerate(groups):
+        g["id"] = i + 1
+        g["key"] = _signature_key(g["signature"])
+    return groups
+
+
+def find_incomplete_sheets(groups):
+    """Flags a smaller group whose signature is a proper subset of a
+    bigger group's signature -- those sheets probably belong with the
+    bigger group but are missing a view/schedule the rest of it has
+    (not detected, or genuinely absent from just that sheet)."""
+    flags = []
+    for g in groups:
+        for other in groups:
+            if other is g or len(other["pages"]) <= len(g["pages"]):
+                continue
+            if g["signature"] < other["signature"]:  # proper subset
+                missing = sorted(other["signature"] - g["signature"])
+                flags.append({"pages": g["pages"], "closest_group_id": other["id"], "missing": missing})
+                break  # groups is sorted biggest-first, so this is the best match
+    return flags
+
+
+def _format_page_ranges(pages):
+    """[1, 2, 3, 5, 6, 9] -> '1-3, 5-6, 9'"""
+    pages = sorted(pages)
+    ranges = []
+    start = prev = pages[0]
+    for p in pages[1:]:
+        if p == prev + 1:
+            prev = p
+            continue
+        ranges.append((start, prev))
+        start = prev = p
+    ranges.append((start, prev))
+    return ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in ranges)
+
+
+# ============================================================
 # UI
 # ============================================================
 st.title("📐 Sheet Region Exporter")
 st.caption(
     "Upload a drawing sheet PDF. Schedules, views, and the notes block are "
-    "auto-detected and listed below in reading order -- check the ones you "
-    "want and export them onto a new PDF at whatever paper size you need."
+    "auto-detected on every sheet. Sheets sharing the exact same set of "
+    "view/schedule names are grouped into one project -- check what you want "
+    "once per group and it's applied to every sheet in it -- then export "
+    "onto a new PDF (one output page per sheet) at whatever paper size you need."
 )
 
 with st.sidebar:
@@ -1082,53 +1147,108 @@ if st.session_state.pdf_bytes is not None:
             except Exception as e:
                 st.error(f"Couldn't render preview: {e}")
 
-            st.subheader("Detected Regions")
+            st.subheader("Sheet Groups")
             st.caption(
-                "Uncheck anything you don't want exported. Titles and box coordinates (in PDF points, "
-                "top-left origin) are editable if a detection looks off -- you can also add or delete rows."
+                "Sheets with the exact same set of view/schedule names are treated as one "
+                "repeatable project: check the ones you want from a group once below, and "
+                "that selection is applied to every sheet in that group automatically."
             )
-            colored_legend = " &nbsp; ".join(
-                f'<span style="color:rgb{c}">■</span> {k}' for k, c in KIND_COLORS.items()
-            )
-            st.markdown(colored_legend, unsafe_allow_html=True)
 
-            edited = st.data_editor(
-                st.session_state.regions_df,
-                column_config={
-                    "Include": st.column_config.CheckboxColumn("Include", default=False),
-                    "Page": st.column_config.NumberColumn("Page", min_value=1, max_value=n_pages, step=1),
-                    "Kind": st.column_config.SelectboxColumn("Kind", options=["Schedule", "View", "Notes"]),
-                    "Title": st.column_config.TextColumn("Title", width="medium"),
-                    "X0": st.column_config.NumberColumn("X0", format="%.1f"),
-                    "Y0": st.column_config.NumberColumn("Y0", format="%.1f"),
-                    "X1": st.column_config.NumberColumn("X1", format="%.1f"),
-                    "Y1": st.column_config.NumberColumn("Y1", format="%.1f"),
-                },
-                num_rows="dynamic",
-                use_container_width=True,
-                key="editor_regions",
-            )
-            st.session_state.regions_df = edited
-            _persist_current_state()
+            groups = group_sheets_by_signature(st.session_state.regions_df)
+            incomplete_flags = find_incomplete_sheets(groups)
+            for f in incomplete_flags:
+                missing_str = ", ".join(f"{k}: {t}" for k, t in f["missing"])
+                st.warning(
+                    f"Sheet(s) {_format_page_ranges(f['pages'])} look like they belong with "
+                    f"Group {f['closest_group_id']} but are missing: {missing_str}. They'll "
+                    "only export whatever was actually detected on them."
+                )
 
-            col_a, col_b, col_c, _ = st.columns([1, 1, 1.6, 2.4])
-            with col_a:
-                if st.button("Select All"):
-                    st.session_state.regions_df["Include"] = True
-                    _persist_current_state()
-                    st.rerun()
-            with col_b:
-                if st.button("Deselect All"):
-                    st.session_state.regions_df["Include"] = False
-                    _persist_current_state()
-                    st.rerun()
-            with col_c:
-                if st.button("Forget saved checks for this file"):
-                    cache = _load_cache()
-                    cache.pop(st.session_state.pdf_hash, None)
-                    _save_cache(cache)
-                    st.session_state.regions_df["Include"] = False
-                    st.rerun()
+            group_cache = _load_cache()
+            group_cache_entry = group_cache.setdefault(st.session_state.pdf_hash, {})
+            group_selections = group_cache_entry.setdefault("group_selections", {})
+
+            for g in groups:
+                sig_sorted = sorted(g["signature"])
+                saved = {tuple(x) for x in group_selections.get(g["key"], [])}
+                with st.container(border=True):
+                    st.markdown(f"**Group {g['id']}** -- {len(g['pages'])} sheet(s) "
+                                f"(page {_format_page_ranges(g['pages'])})")
+                    n_cols = min(len(sig_sorted), 4) or 1
+                    cols = st.columns(n_cols)
+                    checked = set()
+                    for i, (kind, title) in enumerate(sig_sorted):
+                        default = (kind, title) in saved
+                        val = cols[i % n_cols].checkbox(
+                            f"{kind}: {title}", value=default, key=f"grp_{g['key']}_{kind}_{title}"
+                        )
+                        if val:
+                            checked.add((kind, title))
+
+                df = st.session_state.regions_df
+                mask = df["Page"].astype(int).isin(g["pages"])
+                for kind, title in sig_sorted:
+                    row_mask = mask & (df["Kind"] == kind) & (df["Title"] == title)
+                    df.loc[row_mask, "Include"] = (kind, title) in checked
+                st.session_state.regions_df = df
+                group_selections[g["key"]] = [list(t) for t in checked]
+
+            group_cache[st.session_state.pdf_hash] = group_cache_entry
+            _save_cache(group_cache)
+
+            st.divider()
+
+            with st.expander("Fine-tune individual detections (advanced)"):
+                st.caption(
+                    "Per-sheet detail, for the rare case a detection box or title needs a manual "
+                    "correction. Titles and box coordinates (in PDF points, top-left origin) are "
+                    "editable, and you can add or delete rows. Note: the Include checkbox here is "
+                    "normally driven by the Sheet Groups selections above -- toggling it manually is "
+                    "only a temporary override and will be replaced the next time a group checkbox "
+                    "changes or a Select All/Deselect All button runs."
+                )
+                colored_legend = " &nbsp; ".join(
+                    f'<span style="color:rgb{c}">■</span> {k}' for k, c in KIND_COLORS.items()
+                )
+                st.markdown(colored_legend, unsafe_allow_html=True)
+
+                edited = st.data_editor(
+                    st.session_state.regions_df,
+                    column_config={
+                        "Include": st.column_config.CheckboxColumn("Include", default=False),
+                        "Page": st.column_config.NumberColumn("Page", min_value=1, max_value=n_pages, step=1),
+                        "Kind": st.column_config.SelectboxColumn("Kind", options=["Schedule", "View", "Notes"]),
+                        "Title": st.column_config.TextColumn("Title", width="medium"),
+                        "X0": st.column_config.NumberColumn("X0", format="%.1f"),
+                        "Y0": st.column_config.NumberColumn("Y0", format="%.1f"),
+                        "X1": st.column_config.NumberColumn("X1", format="%.1f"),
+                        "Y1": st.column_config.NumberColumn("Y1", format="%.1f"),
+                    },
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    key="editor_regions",
+                )
+                st.session_state.regions_df = edited
+                _persist_current_state()
+
+                col_a, col_b, col_c, _ = st.columns([1, 1, 1.6, 2.4])
+                with col_a:
+                    if st.button("Select All"):
+                        st.session_state.regions_df["Include"] = True
+                        _persist_current_state()
+                        st.rerun()
+                with col_b:
+                    if st.button("Deselect All"):
+                        st.session_state.regions_df["Include"] = False
+                        _persist_current_state()
+                        st.rerun()
+                with col_c:
+                    if st.button("Forget saved checks for this file"):
+                        cache = _load_cache()
+                        cache.pop(st.session_state.pdf_hash, None)
+                        _save_cache(cache)
+                        st.session_state.regions_df["Include"] = False
+                        st.rerun()
 
             st.divider()
             selected = st.session_state.regions_df[st.session_state.regions_df["Include"] == True]
