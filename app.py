@@ -19,7 +19,9 @@ the preview -- nothing is locked in until you click Generate.
 Run with:  streamlit run sheet_region_exporter.py
 """
 
+import hashlib
 import io
+import json
 import os
 import re
 import tempfile
@@ -34,6 +36,37 @@ from PIL import Image, ImageDraw
 from scipy import ndimage
 
 # ============================================================
+# Local persistence (remembers checkbox selections + footer fields
+# per-PDF across app restarts, keyed by a hash of the file contents)
+# ============================================================
+CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sre_cache.json")
+
+
+def _pdf_hash(pdf_bytes):
+    return hashlib.sha256(pdf_bytes).hexdigest()[:20]
+
+
+def _region_key(page, kind, title):
+    return f"{page}|{kind}|{title}"
+
+
+def _load_cache():
+    try:
+        with open(CACHE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_cache(cache):
+    try:
+        with open(CACHE_PATH, "w") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
+# ============================================================
 # Session state init (stability pattern)
 # ============================================================
 if "initialized" not in st.session_state:
@@ -44,7 +77,11 @@ if "initialized" not in st.session_state:
     st.session_state.detected = False
     st.session_state.pdf_bytes = None
     st.session_state.pdf_name = None
+    st.session_state.pdf_hash = None
     st.session_state.uploader_key = 0
+    st.session_state.drawing_name = ""
+    st.session_state.drawing_no = ""
+    st.session_state.project_name = ""
 
 st.set_page_config(page_title="Sheet Region Exporter", layout="wide")
 
@@ -405,6 +442,100 @@ def detect_all_pages(pdf_bytes, page_numbers):
 
 
 # ============================================================
+# Title-block field extraction (Drawing Name / Drawing No / Project Name)
+# ============================================================
+TB_LABEL_KEYWORDS = ["DRAWING NAME", "DRAWING NO", "PROJECT NO", "SHEET NO",
+                     "DESIGN BY", "DRAWN BY", "CHECKED BY", "SCALE", "DATE",
+                     "REVISIONS", "OF"]
+_ADDRESS_RE = re.compile(r"\b[A-Z]{2}\s+\d{5}\b")
+
+
+def _is_tb_label(text):
+    tu = text.strip().upper().rstrip(":.").strip()
+    return any(tu == kw or tu.startswith(kw) for kw in TB_LABEL_KEYWORDS)
+
+
+def _tb_expand(b, p):
+    return (b[0] - p, b[1] - p, b[2] + p, b[3] + p)
+
+
+def _tb_overlaps(a, b):
+    return not (a[2] < b[0] or b[2] < a[0] or a[3] < b[1] or b[3] < a[1])
+
+
+def _find_value_near_label(spans, label_kw, pad=25):
+    label_span = None
+    for s in spans:
+        tu = s["text"].strip().upper().rstrip(":.").strip()
+        if tu == label_kw:
+            label_span = s
+            break
+    if not label_span:
+        return None
+    cands = [s for s in spans if s is not label_span and not _is_tb_label(s["text"])
+             and _tb_overlaps(_tb_expand(label_span["bbox"], pad), s["bbox"])]
+    if not cands:
+        return None
+    return max(cands, key=lambda s: s["size"])["text"].strip()
+
+
+def extract_title_block_fields(pdf_bytes, page_index=0):
+    """Best-effort auto-detect of Drawing Name / Drawing No / Project Name
+    from a Revit-style title block (works even when that block's text is
+    rotated 90 degrees along a vertical sheet edge). Any field it can't
+    confidently find is returned as an empty string -- the UI lets you
+    correct these before export."""
+    result = {"drawing_name": "", "drawing_no": "", "project_name": ""}
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[page_index]
+        page_w, page_h = page.rect.width, page.rect.height
+        d = page.get_text("dict")
+        spans = []
+        for block in d["blocks"]:
+            for line in block.get("lines", []):
+                for span in line["spans"]:
+                    if span["text"].strip():
+                        spans.append({"text": span["text"], "bbox": span["bbox"], "size": span["size"]})
+        doc.close()
+
+        dn = _find_value_near_label(spans, "DRAWING NAME")
+        dno = _find_value_near_label(spans, "DRAWING NO")
+        if dn:
+            result["drawing_name"] = dn
+        if dno:
+            result["drawing_no"] = dno
+
+        # Project name: title-block text usually lives in a narrow strip
+        # along one edge of the sheet; look wherever a "DRAWING NO"/"DRAWING
+        # NAME" label was actually found (fall back to the right-hand 15%
+        # of the page, the common Revit convention, if no label matched).
+        anchor = None
+        for s in spans:
+            tu = s["text"].strip().upper().rstrip(":.").strip()
+            if tu in ("DRAWING NAME", "DRAWING NO"):
+                anchor = s
+                break
+        if anchor:
+            strip_x0 = anchor["bbox"][0] - 250
+        else:
+            strip_x0 = page_w * 0.85
+
+        tb_spans = [s for s in spans if s["bbox"][0] > strip_x0]
+        top_cluster = [s for s in tb_spans
+                       if s["bbox"][1] < page_h * 0.28
+                       and s["size"] >= 15  # project-name text is set noticeably larger than field labels/values
+                       and not _ADDRESS_RE.search(s["text"])
+                       and not _is_tb_label(s["text"])]
+        if top_cluster:
+            leftmost = min(top_cluster, key=lambda s: s["bbox"][0])
+            result["project_name"] = leftmost["text"].strip()
+    except Exception:
+        pass
+    return result
+
+
+# ============================================================
 # Preview rendering
 # ============================================================
 def render_preview_image(pdf_bytes, page_index, regions_for_page, dpi=100):
@@ -430,18 +561,14 @@ def render_preview_image(pdf_bytes, page_index, regions_for_page, dpi=100):
 # ============================================================
 # Output PDF composition (vector-quality crop via show_pdf_page)
 # ============================================================
-def _shelf_pack(regions, content_w, content_h, title_h, spacing, scale, title_fontsize=11):
+def _shelf_pack(regions, content_w, content_h, spacing, scale):
     """Greedy shelf (row) packing at a fixed uniform scale. Returns
     (rows, total_height) where rows is a list of lists of
-    (region, scaled_w, scaled_h) in placement order. Each slot is widened
-    if needed so the title caption text isn't wider than the drawing."""
+    (region, scaled_w, scaled_h) in placement order."""
     rows, cur_row, cur_row_w, cur_row_h = [], [], 0.0, 0.0
     for r in regions:
         rw, rh = r["X1"] - r["X0"], r["Y1"] - r["Y0"]
-        title_text = f"{r['Kind']}: {r['Title']}"
-        title_w = pymupdf.get_text_length(title_text, fontname="helv", fontsize=title_fontsize) + 4
-        sw = max(rw * scale, title_w)
-        sh = rh * scale + title_h
+        sw, sh = rw * scale, rh * scale
         add_w = sw + (spacing if cur_row else 0)
         if cur_row and (cur_row_w + add_w > content_w):
             rows.append((cur_row_h, cur_row))
@@ -456,13 +583,13 @@ def _shelf_pack(regions, content_w, content_h, title_h, spacing, scale, title_fo
     return rows, total_h
 
 
-def _best_single_page_scale(regions, content_w, content_h, title_h, spacing, title_fontsize=11):
+def _best_single_page_scale(regions, content_w, content_h, spacing):
     """Binary search the largest uniform scale at which every selected
     region still fits on one page via shelf packing."""
     lo, hi = 0.0005, 8.0
     for _ in range(50):
         mid = (lo + hi) / 2
-        _, total_h = _shelf_pack(regions, content_w, content_h, title_h, spacing, mid, title_fontsize)
+        _, total_h = _shelf_pack(regions, content_w, content_h, spacing, mid)
         if total_h <= content_h:
             lo = mid
         else:
@@ -470,23 +597,44 @@ def _best_single_page_scale(regions, content_w, content_h, title_h, spacing, tit
     return lo
 
 
+FOOTER_FONTSIZE = 8
+
+
+def _draw_footer(page, w, h, margin, footer_fields):
+    """Draws 'DRAWING NAME: x   DRAWING NO: x   PROJECT: x' along the
+    bottom margin of a page, skipping any field left blank."""
+    parts = []
+    if footer_fields.get("project_name"):
+        parts.append(f"PROJECT: {footer_fields['project_name']}")
+    if footer_fields.get("drawing_name"):
+        parts.append(f"DRAWING NAME: {footer_fields['drawing_name']}")
+    if footer_fields.get("drawing_no"):
+        parts.append(f"DRAWING NO: {footer_fields['drawing_no']}")
+    if not parts:
+        return
+    text = "     |     ".join(parts)
+    y = h - margin * 0.45
+    page.draw_line((margin, y - FOOTER_FONTSIZE - 4), (w - margin, y - FOOTER_FONTSIZE - 4),
+                    color=(0.75, 0.75, 0.75), width=0.5)
+    page.insert_text((margin, y), text, fontsize=FOOTER_FONTSIZE, fontname="helv", color=(0.2, 0.2, 0.2))
+
+
 def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
-                      margin=36, spacing=18, title_fontsize=11, single_page=True):
+                      margin=36, spacing=18, single_page=True, footer_fields=None):
     w, h = PAPER_SIZES_PT[paper_key]
     if orientation == "Landscape":
         w, h = h, w
 
+    footer_fields = footer_fields or {}
     src = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     out = pymupdf.open()
     content_w = w - 2 * margin
     content_h = h - 2 * margin
-    title_h = title_fontsize + 8
 
     valid_regions = [r for r in selected_regions if (r["X1"] - r["X0"]) > 0 and (r["Y1"] - r["Y0"]) > 0]
+    all_pages = []
 
-    def _place(page, r, dest_rect, title_size):
-        page.insert_text((dest_rect.x0, dest_rect.y0 - 3),
-                          f"{r['Kind']}: {r['Title']}", fontsize=title_size, fontname="helv")
+    def _place(page, r, dest_rect):
         src_bbox = pymupdf.Rect(r["X0"], r["Y0"], r["X1"], r["Y1"])
         try:
             page.show_pdf_page(dest_rect, src, int(r["Page"]) - 1, clip=src_bbox)
@@ -498,58 +646,49 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
         # Squeeze every selected item onto a single sheet: binary-search a
         # uniform scale small enough that a greedy row-pack of all items
         # fits within one page, then lay them out at that scale.
-        scale = _best_single_page_scale(valid_regions, content_w, content_h, title_h, spacing)
-        rows, _ = _shelf_pack(valid_regions, content_w, content_h, title_h, spacing, scale)
+        scale = _best_single_page_scale(valid_regions, content_w, content_h, spacing)
+        rows, _ = _shelf_pack(valid_regions, content_w, content_h, spacing, scale)
         page = out.new_page(width=w, height=h)
+        all_pages.append(page)
         cursor_y = margin
         for row_h, items in rows:
             cursor_x = margin
             for r, sw, sh in items:
-                title_top = cursor_y + title_h
-                drawing_w = (r["X1"] - r["X0"]) * scale
-                x_off = cursor_x + max((sw - drawing_w) / 2, 0)  # center drawing within its slot
-                dest_rect = pymupdf.Rect(x_off, title_top,
-                                          x_off + drawing_w, title_top + (sh - title_h))
-                page.insert_text((cursor_x, cursor_y + title_fontsize),
-                                  f"{r['Kind']}: {r['Title']}", fontsize=title_fontsize, fontname="helv")
-                src_bbox = pymupdf.Rect(r["X0"], r["Y0"], r["X1"], r["Y1"])
-                try:
-                    page.show_pdf_page(dest_rect, src, int(r["Page"]) - 1, clip=src_bbox)
-                    page.draw_rect(dest_rect, color=(0.6, 0.6, 0.6), width=0.5)
-                except Exception:
-                    pass
+                dest_rect = pymupdf.Rect(cursor_x, cursor_y, cursor_x + sw, cursor_y + sh)
+                _place(page, r, dest_rect)
                 cursor_x += sw + spacing
             cursor_y += row_h + spacing
     else:
         # Natural size, flowing onto as many pages as needed.
         page = out.new_page(width=w, height=h)
+        all_pages.append(page)
         cursor_y = margin
         for r in valid_regions:
             rw, rh = r["X1"] - r["X0"], r["Y1"] - r["Y0"]
 
             scale = content_w / rw
             scaled_h = rh * scale
-            needed = title_h + scaled_h
-            if needed > content_h:
-                scale = min(scale, (content_h - title_h) / rh)
+            if scaled_h > content_h:
+                scale = content_h / rh
                 scaled_h = rh * scale
-                needed = title_h + scaled_h
 
             remaining = margin + content_h - cursor_y
-            if cursor_y > margin and needed > remaining:
+            if cursor_y > margin and scaled_h > remaining:
                 page = out.new_page(width=w, height=h)
+                all_pages.append(page)
                 cursor_y = margin
                 scale = content_w / rw
                 scaled_h = rh * scale
-                needed = title_h + scaled_h
-                if needed > content_h:
-                    scale = min(scale, (content_h - title_h) / rh)
+                if scaled_h > content_h:
+                    scale = content_h / rh
                     scaled_h = rh * scale
 
-            title_top = cursor_y + title_h
-            dest_rect = pymupdf.Rect(margin, title_top, margin + rw * scale, title_top + scaled_h)
-            _place(page, r, dest_rect, title_fontsize)
-            cursor_y = title_top + scaled_h + spacing
+            dest_rect = pymupdf.Rect(margin, cursor_y, margin + rw * scale, cursor_y + scaled_h)
+            _place(page, r, dest_rect)
+            cursor_y = cursor_y + scaled_h + spacing
+
+    for p in all_pages:
+        _draw_footer(p, w, h, margin, footer_fields)
 
     buf = out.tobytes()
     out.close()
@@ -592,10 +731,25 @@ if uploaded is not None:
     if st.session_state.pdf_bytes != pdf_bytes:
         st.session_state.pdf_bytes = pdf_bytes
         st.session_state.pdf_name = uploaded.name
+        st.session_state.pdf_hash = _pdf_hash(pdf_bytes)
         st.session_state.detected = False
         st.session_state.regions_df = pd.DataFrame(
             columns=["Include", "Page", "Kind", "Title", "X0", "Y0", "X1", "Y1"]
         )
+
+        cache = _load_cache()
+        entry = cache.get(st.session_state.pdf_hash, {})
+        saved_footer = entry.get("footer", {})
+        if saved_footer:
+            # We've seen this exact file before -- restore what was typed last time.
+            st.session_state.drawing_name = saved_footer.get("drawing_name", "")
+            st.session_state.drawing_no = saved_footer.get("drawing_no", "")
+            st.session_state.project_name = saved_footer.get("project_name", "")
+        else:
+            guessed = extract_title_block_fields(pdf_bytes)
+            st.session_state.drawing_name = guessed["drawing_name"]
+            st.session_state.drawing_no = guessed["drawing_no"]
+            st.session_state.project_name = guessed["project_name"]
 
 if st.session_state.pdf_bytes is not None:
     try:
@@ -604,6 +758,40 @@ if st.session_state.pdf_bytes is not None:
     except Exception as e:
         st.error(f"Couldn't open that PDF: {e}")
         n_pages = 0
+
+    with st.sidebar:
+        st.header("Footer")
+        st.caption("Printed along the bottom of every exported page. Auto-filled "
+                   "from the title block where possible -- correct anything that's "
+                   "off; it's remembered next time you open this same PDF.")
+        st.session_state.project_name = st.text_input("Project Name", st.session_state.project_name)
+        st.session_state.drawing_name = st.text_input("Drawing Name", st.session_state.drawing_name)
+        st.session_state.drawing_no = st.text_input("Drawing No.", st.session_state.drawing_no)
+
+
+def _persist_current_state():
+    """Saves checkbox states + footer field values for the current PDF so
+    they're recalled next time this same file is opened."""
+    if not st.session_state.get("pdf_hash"):
+        return
+    cache = _load_cache()
+    entry = cache.setdefault(st.session_state.pdf_hash, {})
+    entry["footer"] = {
+        "drawing_name": st.session_state.drawing_name,
+        "drawing_no": st.session_state.drawing_no,
+        "project_name": st.session_state.project_name,
+    }
+    regions_map = {}
+    for _, row in st.session_state.regions_df.iterrows():
+        key = _region_key(int(row["Page"]), row["Kind"], row["Title"])
+        regions_map[key] = bool(row["Include"])
+    entry["regions"] = regions_map
+    cache[st.session_state.pdf_hash] = entry
+    _save_cache(cache)
+
+
+if st.session_state.pdf_bytes is not None:
+    _persist_current_state()
 
     if n_pages:
         page_choices = list(range(1, n_pages + 1))
@@ -615,8 +803,12 @@ if st.session_state.pdf_bytes is not None:
             with st.spinner("Scanning sheet layout..."):
                 try:
                     regions = detect_all_pages(st.session_state.pdf_bytes, pages_to_scan)
+                    cache = _load_cache()
+                    saved_includes = cache.get(st.session_state.pdf_hash, {}).get("regions", {})
                     rows = [{
-                        "Include": True, "Page": r["page"] + 1, "Kind": r["kind"], "Title": r["title"],
+                        "Include": bool(saved_includes.get(
+                            _region_key(r["page"] + 1, r["kind"], r["title"]), False)),
+                        "Page": r["page"] + 1, "Kind": r["kind"], "Title": r["title"],
                         "X0": round(r["bbox"][0], 1), "Y0": round(r["bbox"][1], 1),
                         "X1": round(r["bbox"][2], 1), "Y1": round(r["bbox"][3], 1),
                     } for r in regions]
@@ -626,7 +818,12 @@ if st.session_state.pdf_bytes is not None:
                         st.warning("No schedules, views, or notes were detected on the selected page(s). "
                                    "You can still add regions manually in the table below.")
                     else:
-                        st.success(f"Found {len(rows)} region(s). Review the boxes below, adjust as needed.")
+                        n_restored = sum(1 for r in rows if r["Include"])
+                        msg = f"Found {len(rows)} region(s), all unchecked by default."
+                        if n_restored:
+                            msg = (f"Found {len(rows)} region(s) -- restored {n_restored} "
+                                   f"checkmark(s) you'd saved for this file previously.")
+                        st.success(msg)
                 except Exception as e:
                     st.error(f"Detection failed: {type(e).__name__}: {e}")
                     with st.expander("Details"):
@@ -665,7 +862,7 @@ if st.session_state.pdf_bytes is not None:
             edited = st.data_editor(
                 st.session_state.regions_df,
                 column_config={
-                    "Include": st.column_config.CheckboxColumn("Include", default=True),
+                    "Include": st.column_config.CheckboxColumn("Include", default=False),
                     "Page": st.column_config.NumberColumn("Page", min_value=1, max_value=n_pages, step=1),
                     "Kind": st.column_config.SelectboxColumn("Kind", options=["Schedule", "View", "Notes"]),
                     "Title": st.column_config.TextColumn("Title", width="medium"),
@@ -679,14 +876,24 @@ if st.session_state.pdf_bytes is not None:
                 key="editor_regions",
             )
             st.session_state.regions_df = edited
+            _persist_current_state()
 
-            col_a, col_b, _ = st.columns([1, 1, 3])
+            col_a, col_b, col_c, _ = st.columns([1, 1, 1.6, 2.4])
             with col_a:
                 if st.button("Select All"):
                     st.session_state.regions_df["Include"] = True
+                    _persist_current_state()
                     st.rerun()
             with col_b:
                 if st.button("Deselect All"):
+                    st.session_state.regions_df["Include"] = False
+                    _persist_current_state()
+                    st.rerun()
+            with col_c:
+                if st.button("Forget saved checks for this file"):
+                    cache = _load_cache()
+                    cache.pop(st.session_state.pdf_hash, None)
+                    _save_cache(cache)
                     st.session_state.regions_df["Include"] = False
                     st.rerun()
 
@@ -698,11 +905,16 @@ if st.session_state.pdf_bytes is not None:
                 with st.spinner("Building output PDF..."):
                     try:
                         selected_sorted = selected.sort_values(by=["Page", "Y0", "X0"])
+                        footer_fields = {
+                            "project_name": st.session_state.project_name.strip(),
+                            "drawing_name": st.session_state.drawing_name.strip(),
+                            "drawing_no": st.session_state.drawing_no.strip(),
+                        }
                         out_bytes = build_output_pdf(
                             st.session_state.pdf_bytes,
                             selected_sorted.to_dict("records"),
                             paper_key, orientation, margin=margin, spacing=spacing,
-                            single_page=single_page,
+                            single_page=single_page, footer_fields=footer_fields,
                         )
                         base = os.path.splitext(st.session_state.pdf_name or "sheet")[0]
                         mode_tag = "ONEPAGE" if single_page else "MULTIPAGE"
