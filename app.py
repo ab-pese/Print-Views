@@ -35,6 +35,12 @@ import streamlit as st
 from PIL import Image, ImageDraw
 from scipy import ndimage
 
+try:
+    from streamlit_drawable_canvas import st_canvas
+    HAS_CANVAS = True
+except Exception:
+    HAS_CANVAS = False
+
 # ============================================================
 # Local persistence (remembers checkbox selections + footer fields
 # per-PDF across app restarts, keyed by a hash of the file contents)
@@ -82,6 +88,9 @@ if "initialized" not in st.session_state:
     st.session_state.drawing_name = ""
     st.session_state.drawing_no = ""
     st.session_state.project_name = ""
+    st.session_state.canvas_selection_key = None
+    st.session_state.canvas_initial = None
+    st.session_state.canvas_region_order = []
 
 st.set_page_config(page_title="Sheet Region Exporter", layout="wide")
 
@@ -620,7 +629,12 @@ def _draw_footer(page, w, h, margin, footer_fields):
 
 
 def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
-                      margin=36, spacing=18, single_page=True, footer_fields=None):
+                      margin=36, spacing=18, single_page=True, footer_fields=None,
+                      manual_dest=None):
+    """manual_dest, if given, is a list (same length/order as selected_regions)
+    of dicts {'x','y','w','h'} in PDF points on a single page -- this is the
+    exact placement the user dragged/resized in the layout editor, and
+    overrides the automatic squeeze/flow packing entirely."""
     w, h = PAPER_SIZES_PT[paper_key]
     if orientation == "Landscape":
         w, h = h, w
@@ -638,11 +652,20 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
         src_bbox = pymupdf.Rect(r["X0"], r["Y0"], r["X1"], r["Y1"])
         try:
             page.show_pdf_page(dest_rect, src, int(r["Page"]) - 1, clip=src_bbox)
-            page.draw_rect(dest_rect, color=(0.6, 0.6, 0.6), width=0.5)
         except Exception:
             pass
 
-    if single_page:
+    if manual_dest is not None:
+        page = out.new_page(width=w, height=h)
+        all_pages.append(page)
+        for r, dest in zip(selected_regions, manual_dest):
+            if (r["X1"] - r["X0"]) <= 0 or (r["Y1"] - r["Y0"]) <= 0:
+                continue
+            if dest["w"] <= 0 or dest["h"] <= 0:
+                continue
+            dest_rect = pymupdf.Rect(dest["x"], dest["y"], dest["x"] + dest["w"], dest["y"] + dest["h"])
+            _place(page, r, dest_rect)
+    elif single_page:
         # Squeeze every selected item onto a single sheet: binary-search a
         # uniform scale small enough that a greedy row-pack of all items
         # fits within one page, then lay them out at that scale.
@@ -697,6 +720,114 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
 
 
 # ============================================================
+# Manual drag & resize layout editor (optional, needs
+# streamlit-drawable-canvas)
+# ============================================================
+CANVAS_MAX_W = 720
+CANVAS_MAX_H = 900
+
+
+def _canvas_dims(page_w, page_h):
+    cw = CANVAS_MAX_W
+    ch = cw * page_h / page_w
+    if ch > CANVAS_MAX_H:
+        ch = CANVAS_MAX_H
+        cw = ch * page_w / page_h
+    return cw, ch
+
+
+def build_canvas_initial_layout(selected_rows, page_w, page_h, margin, spacing):
+    """Starting positions for the layout editor: reuse the squeeze-pack
+    layout as a sensible default, converted into canvas pixel space."""
+    cw, ch = _canvas_dims(page_w, page_h)
+    canvas_scale = cw / page_w
+    content_w = page_w - 2 * margin
+    content_h = page_h - 2 * margin
+
+    scale = _best_single_page_scale(selected_rows, content_w, content_h, spacing)
+    rows, _ = _shelf_pack(selected_rows, content_w, content_h, spacing, scale)
+
+    objects = []
+    order = []
+    cursor_y = margin
+    for row_h, items in rows:
+        cursor_x = margin
+        for r, sw, sh in items:
+            objects.append({
+                "type": "rect", "left": cursor_x * canvas_scale, "top": cursor_y * canvas_scale,
+                "width": sw * canvas_scale, "height": sh * canvas_scale,
+                "scaleX": 1, "scaleY": 1, "angle": 0,
+                "fill": "rgba(46, 96, 166, 0.15)", "stroke": "#2e60a6", "strokeWidth": 1.5,
+                "lockRotation": True, "hasRotatingPoint": False,
+            })
+            order.append((int(r["Page"]), r["Kind"], r["Title"], r["X0"], r["Y0"], r["X1"], r["Y1"]))
+            cursor_x += sw + spacing
+        cursor_y += row_h + spacing
+    return {"version": "4.4.0", "objects": objects}, order
+
+
+def build_grid_initial_layout(selected_rows, page_w, page_h, margin, spacing, cols, rows):
+    """Arranges selected regions into a fixed cols x rows grid, each item
+    scaled to fit its cell (preserving its own aspect ratio, centered).
+    If there are more items than cells, extra rows are added automatically
+    so nothing gets dropped."""
+    n = len(selected_rows)
+    cols = max(1, int(cols))
+    rows = max(1, int(rows))
+    if n > cols * rows:
+        rows = -(-n // cols)  # ceil division -- grow rows to fit everyone
+
+    cw, ch = _canvas_dims(page_w, page_h)
+    canvas_scale = cw / page_w
+    content_w = page_w - 2 * margin
+    content_h = page_h - 2 * margin
+    cell_w = (content_w - spacing * (cols - 1)) / cols
+    cell_h = (content_h - spacing * (rows - 1)) / rows
+
+    objects, order = [], []
+    for i, r in enumerate(selected_rows):
+        row_i, col_i = divmod(i, cols)
+        cell_x = margin + col_i * (cell_w + spacing)
+        cell_y = margin + row_i * (cell_h + spacing)
+
+        rw, rh = r["X1"] - r["X0"], r["Y1"] - r["Y0"]
+        if rw <= 0 or rh <= 0:
+            continue
+        item_scale = min(cell_w / rw, cell_h / rh)
+        iw, ih = rw * item_scale, rh * item_scale
+        ix = cell_x + (cell_w - iw) / 2  # center within the cell
+        iy = cell_y + (cell_h - ih) / 2
+
+        objects.append({
+            "type": "rect", "left": ix * canvas_scale, "top": iy * canvas_scale,
+            "width": iw * canvas_scale, "height": ih * canvas_scale,
+            "scaleX": 1, "scaleY": 1, "angle": 0,
+            "fill": "rgba(46, 96, 166, 0.15)", "stroke": "#2e60a6", "strokeWidth": 1.5,
+            "lockRotation": True, "hasRotatingPoint": False,
+        })
+        order.append((int(r["Page"]), r["Kind"], r["Title"], r["X0"], r["Y0"], r["X1"], r["Y1"]))
+    return {"version": "4.4.0", "objects": objects}, order
+
+
+def canvas_objects_to_dest(json_objects, page_w, page_h):
+    """Converts fabric.js canvas object dicts back into PDF-point
+    {'x','y','w','h'} placements, in the same order they were passed in."""
+    cw, ch = _canvas_dims(page_w, page_h)
+    canvas_scale = cw / page_w
+    dests = []
+    for obj in json_objects:
+        left = obj.get("left", 0)
+        top = obj.get("top", 0)
+        width = obj.get("width", 0) * obj.get("scaleX", 1)
+        height = obj.get("height", 0) * obj.get("scaleY", 1)
+        dests.append({
+            "x": left / canvas_scale, "y": top / canvas_scale,
+            "w": width / canvas_scale, "h": height / canvas_scale,
+        })
+    return dests
+
+
+# ============================================================
 # UI
 # ============================================================
 st.title("📐 Sheet Region Exporter")
@@ -710,16 +841,25 @@ with st.sidebar:
     st.header("Output Settings")
     paper_key = st.selectbox("Paper size", list(PAPER_SIZES_PT.keys()))
     orientation = st.radio("Orientation", ["Portrait", "Landscape"], horizontal=True)
+    layout_options = ["Squeeze onto one sheet", "Natural size (multiple sheets)"]
+    if HAS_CANVAS:
+        layout_options.append("Manual layout (drag & resize)")
     layout_mode = st.radio(
         "Layout",
-        ["Squeeze onto one sheet", "Natural size (multiple sheets)"],
+        layout_options,
         index=0,
         help="'Squeeze onto one sheet' shrinks everything checked below, as "
              "a group, to the largest uniform scale that still fits all of "
              "it on a single page. 'Natural size' places each item at full "
-             "scale and flows onto additional pages as needed.",
+             "scale and flows onto additional pages as needed. 'Manual "
+             "layout' lets you drag and resize each item yourself before "
+             "exporting.",
     )
     single_page = layout_mode.startswith("Squeeze")
+    manual_layout = layout_mode.startswith("Manual")
+    if not HAS_CANVAS:
+        st.caption("Tip: `pip install streamlit-drawable-canvas` to unlock a "
+                   "drag-and-resize layout mode.")
     with st.expander("Advanced layout"):
         margin = st.number_input("Margin (pt)", min_value=0, max_value=144, value=36, step=6)
         spacing = st.number_input("Spacing between items (pt)", min_value=0, max_value=72, value=18, step=6)
@@ -900,30 +1040,115 @@ if st.session_state.pdf_bytes is not None:
             st.divider()
             selected = st.session_state.regions_df[st.session_state.regions_df["Include"] == True]
             st.write(f"**{len(selected)}** region(s) selected for export.")
+            selected_sorted = selected.sort_values(by=["Page", "Y0", "X0"])
+            selected_rows = selected_sorted.to_dict("records")
 
-            if st.button("📤 Generate PDF", type="primary", use_container_width=True, disabled=selected.empty):
+            manual_dest_list = None
+            manual_regions = None
+            if manual_layout and not selected.empty:
+                st.subheader("Layout Editor")
+                st.caption(
+                    "Two ways to arrange things: drag an item to reposition it and drag a "
+                    "corner handle to resize it (hold Shift to keep proportions) -- or pick "
+                    "a column x row grid below and click Apply to auto-arrange, then still "
+                    f"fine-tune by dragging. This represents one {paper_key.split(' ')[0]} "
+                    f"{orientation.lower()} output page -- the light grey guide shows your margin."
+                )
+
+                page_w, page_h = PAPER_SIZES_PT[paper_key]
+                if orientation == "Landscape":
+                    page_w, page_h = page_h, page_w
+
+                selection_key = tuple((r["Page"], r["Kind"], r["Title"]) for r in selected_rows)
+                if st.session_state.canvas_selection_key != selection_key:
+                    initial, order = build_canvas_initial_layout(selected_rows, page_w, page_h, margin, spacing)
+                    st.session_state.canvas_initial = initial
+                    st.session_state.canvas_region_order = order
+                    st.session_state.canvas_selection_key = selection_key
+
+                arrange_col1, arrange_col2, arrange_col3, arrange_col4 = st.columns([1.3, 0.8, 0.8, 1.1])
+                with arrange_col1:
+                    if st.button("↺ Reset to auto-packed"):
+                        initial, order = build_canvas_initial_layout(selected_rows, page_w, page_h, margin, spacing)
+                        st.session_state.canvas_initial = initial
+                        st.session_state.canvas_region_order = order
+                with arrange_col2:
+                    grid_cols = st.number_input("Columns", min_value=1, max_value=8, value=2, step=1, key="grid_cols")
+                with arrange_col3:
+                    grid_rows = st.number_input("Rows", min_value=1, max_value=8, value=1, step=1, key="grid_rows")
+                with arrange_col4:
+                    st.write("")  # vertical spacer to align button with the number inputs
+                    if st.button(f"⊞ Apply {int(grid_cols)}x{int(grid_rows)} grid"):
+                        initial, order = build_grid_initial_layout(
+                            selected_rows, page_w, page_h, margin, spacing, grid_cols, grid_rows)
+                        st.session_state.canvas_initial = initial
+                        st.session_state.canvas_region_order = order
+                        if len(selected_rows) > grid_cols * grid_rows:
+                            st.info(f"{len(selected_rows)} items don't fit a "
+                                    f"{int(grid_cols)}x{int(grid_rows)} grid -- added extra row(s) "
+                                    "so nothing was left out.")
+
+                cw, ch = _canvas_dims(page_w, page_h)
+                canvas_scale = cw / page_w
+                margin_guide = Image.new("RGB", (int(cw), int(ch)), "white")
+                gd = ImageDraw.Draw(margin_guide)
+                gd.rectangle(
+                    (margin * canvas_scale, margin * canvas_scale,
+                     cw - margin * canvas_scale, ch - margin * canvas_scale),
+                    outline=(210, 210, 210),
+                )
+
+                canvas_result = st_canvas(
+                    fill_color="rgba(46, 96, 166, 0.15)",
+                    stroke_width=2,
+                    stroke_color="#2e60a6",
+                    background_image=margin_guide,
+                    update_streamlit=True,
+                    height=int(ch), width=int(cw),
+                    drawing_mode="transform",
+                    initial_drawing=st.session_state.canvas_initial,
+                    key="layout_canvas",
+                )
+
+                if canvas_result.json_data is not None:
+                    objs = canvas_result.json_data.get("objects", [])
+                    if len(objs) == len(st.session_state.canvas_region_order):
+                        manual_dest_list = canvas_objects_to_dest(objs, page_w, page_h)
+                        manual_regions = [
+                            {"Page": o[0], "Kind": o[1], "Title": o[2],
+                             "X0": o[3], "Y0": o[4], "X1": o[5], "Y1": o[6]}
+                            for o in st.session_state.canvas_region_order
+                        ]
+                    else:
+                        st.warning("Layout editor is out of sync with the current selection -- "
+                                   "click 'Reset layout to auto-packed' above.")
+
+            gen_disabled = selected.empty or (manual_layout and manual_dest_list is None)
+            if st.button("📤 Generate PDF", type="primary", use_container_width=True, disabled=gen_disabled):
                 with st.spinner("Building output PDF..."):
                     try:
-                        selected_sorted = selected.sort_values(by=["Page", "Y0", "X0"])
                         footer_fields = {
                             "project_name": st.session_state.project_name.strip(),
                             "drawing_name": st.session_state.drawing_name.strip(),
                             "drawing_no": st.session_state.drawing_no.strip(),
                         }
-                        out_bytes = build_output_pdf(
-                            st.session_state.pdf_bytes,
-                            selected_sorted.to_dict("records"),
-                            paper_key, orientation, margin=margin, spacing=spacing,
-                            single_page=single_page, footer_fields=footer_fields,
-                        )
-                        base = os.path.splitext(st.session_state.pdf_name or "sheet")[0]
-                        mode_tag = "ONEPAGE" if single_page else "MULTIPAGE"
-                        out_name = f"{base}_SELECTED_{paper_key.split(' ')[0]}_{orientation}_{mode_tag}.pdf"
-                        if single_page:
-                            n_out_pages = 1
+                        if manual_layout and manual_dest_list is not None:
+                            out_bytes = build_output_pdf(
+                                st.session_state.pdf_bytes, manual_regions,
+                                paper_key, orientation, margin=margin, spacing=spacing,
+                                footer_fields=footer_fields, manual_dest=manual_dest_list,
+                            )
                         else:
-                            with pymupdf.open(stream=out_bytes, filetype="pdf") as _chk:
-                                n_out_pages = len(_chk)
+                            out_bytes = build_output_pdf(
+                                st.session_state.pdf_bytes, selected_rows,
+                                paper_key, orientation, margin=margin, spacing=spacing,
+                                single_page=single_page, footer_fields=footer_fields,
+                            )
+                        base = os.path.splitext(st.session_state.pdf_name or "sheet")[0]
+                        mode_tag = "MANUAL" if manual_layout else ("ONEPAGE" if single_page else "MULTIPAGE")
+                        out_name = f"{base}_SELECTED_{paper_key.split(' ')[0]}_{orientation}_{mode_tag}.pdf"
+                        with pymupdf.open(stream=out_bytes, filetype="pdf") as _chk:
+                            n_out_pages = len(_chk)
                         st.success(f"Done! ({n_out_pages} page{'s' if n_out_pages != 1 else ''})")
                         st.download_button(
                             "⬇️ Download Exported PDF", data=out_bytes,
