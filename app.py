@@ -460,18 +460,37 @@ def detect_regions_on_page(page_pl, page_mu, page_index):
     return regions
 
 
-def detect_all_pages(pdf_bytes, page_numbers):
-    """page_numbers is a 1-indexed list of pages to scan."""
+def detect_all_pages(pdf_bytes, page_numbers, on_progress=None):
+    """page_numbers is a 1-indexed list of pages to scan.
+
+    Returns (all_regions, errors) -- errors is a list of (page_number, message)
+    for any page that failed, so one bad sheet doesn't sink a whole batch.
+    """
     all_regions = []
+    errors = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_pl:
         doc_mu = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        for pno in page_numbers:
+        for i, pno in enumerate(page_numbers):
             idx = pno - 1
             page_pl = pdf_pl.pages[idx]
             page_mu = doc_mu[idx]
-            all_regions.extend(detect_regions_on_page(page_pl, page_mu, idx))
+            try:
+                all_regions.extend(detect_regions_on_page(page_pl, page_mu, idx))
+            except Exception as e:
+                errors.append((pno, f"{type(e).__name__}: {e}"))
+            finally:
+                # pdfplumber caches every char/line/rect/curve it parses on
+                # the Page object itself and never lets go of it on its own;
+                # pdf_pl.pages keeps all of them alive for the life of this
+                # "with" block, so on a vector-heavy (Revit-exported) sheet a
+                # batch of 70+ pages can pile up gigabytes of cached geometry
+                # and get the whole app OOM-killed. Flush each page's cache
+                # as soon as we're done with it.
+                page_pl.close()
+            if on_progress:
+                on_progress(i + 1, len(page_numbers))
         doc_mu.close()
-    return all_regions
+    return all_regions, errors
 
 
 # ============================================================
@@ -652,13 +671,36 @@ def _draw_footer(page, w, h, margin, footer_fields):
     page.insert_text((margin, y), text, fontsize=FOOTER_FONTSIZE, fontname="helv", color=(0.2, 0.2, 0.2))
 
 
+def _group_by_sheet(regions):
+    """Groups regions by their source sheet (input Page), preserving the
+    order sheets first appear in. Each group becomes its own project --
+    one sheet in, one output page (or natural-flow run of pages) out --
+    so items from different sheets never end up sharing an output page."""
+    sheets = {}
+    order = []
+    for r in regions:
+        key = int(r["Page"])
+        if key not in sheets:
+            sheets[key] = []
+            order.append(key)
+        sheets[key].append(r)
+    return [sheets[key] for key in order]
+
+
 def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
                       margin=36, spacing=18, single_page=True, footer_fields=None,
                       manual_dest=None):
-    """manual_dest, if given, is a list (same length/order as selected_regions)
+    """Each source sheet (input PDF page) is treated as its own project:
+    every sheet gets its own output page (in 'squeeze' mode) or its own
+    natural-flow run of output page(s) -- items from two different sheets
+    are never packed onto the same output page together.
+
+    manual_dest, if given, is a list (same length/order as selected_regions)
     of dicts {'x','y','w','h'} in PDF points on a single page -- this is the
-    exact placement the user dragged/resized in the layout editor, and
-    overrides the automatic squeeze/flow packing entirely."""
+    exact placement the user dragged/resized in the layout editor for the
+    current full selection, and overrides the automatic squeeze/flow
+    packing entirely (it does not do the one-page-per-sheet grouping below,
+    since the layout editor works on one combined canvas)."""
     w, h = PAPER_SIZES_PT[paper_key]
     if orientation == "Landscape":
         w, h = h, w
@@ -670,6 +712,12 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
     content_h = h - 2 * margin
 
     valid_regions = [r for r in selected_regions if (r["X1"] - r["X0"]) > 0 and (r["Y1"] - r["Y0"]) > 0]
+    # Track page *numbers*, not the Page objects themselves: PyMuPDF orphans
+    # earlier Page wrappers (parent becomes None) as soon as another page is
+    # added to the document, so holding onto e.g. page 1's object while
+    # pages 2-72 get created and then drawing on it later raises
+    # "AttributeError: 'NoneType' object has no attribute 'is_pdf'". Numbers
+    # stay valid; re-fetch each one fresh via out[n] once everything is built.
     all_pages = []
 
     def _place(page, r, dest_rect):
@@ -681,7 +729,7 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
 
     if manual_dest is not None:
         page = out.new_page(width=w, height=h)
-        all_pages.append(page)
+        all_pages.append(page.number)
         for r, dest in zip(selected_regions, manual_dest):
             if (r["X1"] - r["X0"]) <= 0 or (r["Y1"] - r["Y0"]) <= 0:
                 continue
@@ -689,53 +737,56 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
                 continue
             dest_rect = pymupdf.Rect(dest["x"], dest["y"], dest["x"] + dest["w"], dest["y"] + dest["h"])
             _place(page, r, dest_rect)
-    elif single_page:
-        # Squeeze every selected item onto a single sheet: binary-search a
-        # uniform scale small enough that a greedy row-pack of all items
-        # fits within one page, then lay them out at that scale.
-        scale = _best_single_page_scale(valid_regions, content_w, content_h, spacing)
-        rows, _ = _shelf_pack(valid_regions, content_w, content_h, spacing, scale)
-        page = out.new_page(width=w, height=h)
-        all_pages.append(page)
-        cursor_y = margin
-        for row_h, items in rows:
-            cursor_x = margin
-            for r, sw, sh in items:
-                dest_rect = pymupdf.Rect(cursor_x, cursor_y, cursor_x + sw, cursor_y + sh)
-                _place(page, r, dest_rect)
-                cursor_x += sw + spacing
-            cursor_y += row_h + spacing
     else:
-        # Natural size, flowing onto as many pages as needed.
-        page = out.new_page(width=w, height=h)
-        all_pages.append(page)
-        cursor_y = margin
-        for r in valid_regions:
-            rw, rh = r["X1"] - r["X0"], r["Y1"] - r["Y0"]
-
-            scale = content_w / rw
-            scaled_h = rh * scale
-            if scaled_h > content_h:
-                scale = content_h / rh
-                scaled_h = rh * scale
-
-            remaining = margin + content_h - cursor_y
-            if cursor_y > margin and scaled_h > remaining:
+        for sheet_regions in _group_by_sheet(valid_regions):
+            if single_page:
+                # Squeeze this sheet's items onto a single output page:
+                # binary-search a uniform scale small enough that a greedy
+                # row-pack of the sheet's items fits within one page.
+                scale = _best_single_page_scale(sheet_regions, content_w, content_h, spacing)
+                rows, _ = _shelf_pack(sheet_regions, content_w, content_h, spacing, scale)
                 page = out.new_page(width=w, height=h)
-                all_pages.append(page)
+                all_pages.append(page.number)
                 cursor_y = margin
-                scale = content_w / rw
-                scaled_h = rh * scale
-                if scaled_h > content_h:
-                    scale = content_h / rh
+                for row_h, items in rows:
+                    cursor_x = margin
+                    for r, sw, sh in items:
+                        dest_rect = pymupdf.Rect(cursor_x, cursor_y, cursor_x + sw, cursor_y + sh)
+                        _place(page, r, dest_rect)
+                        cursor_x += sw + spacing
+                    cursor_y += row_h + spacing
+            else:
+                # Natural size, flowing onto as many pages as this one sheet
+                # needs (a new sheet always starts on a fresh output page).
+                page = out.new_page(width=w, height=h)
+                all_pages.append(page.number)
+                cursor_y = margin
+                for r in sheet_regions:
+                    rw, rh = r["X1"] - r["X0"], r["Y1"] - r["Y0"]
+
+                    scale = content_w / rw
                     scaled_h = rh * scale
+                    if scaled_h > content_h:
+                        scale = content_h / rh
+                        scaled_h = rh * scale
 
-            dest_rect = pymupdf.Rect(margin, cursor_y, margin + rw * scale, cursor_y + scaled_h)
-            _place(page, r, dest_rect)
-            cursor_y = cursor_y + scaled_h + spacing
+                    remaining = margin + content_h - cursor_y
+                    if cursor_y > margin and scaled_h > remaining:
+                        page = out.new_page(width=w, height=h)
+                        all_pages.append(page.number)
+                        cursor_y = margin
+                        scale = content_w / rw
+                        scaled_h = rh * scale
+                        if scaled_h > content_h:
+                            scale = content_h / rh
+                            scaled_h = rh * scale
 
-    for p in all_pages:
-        _draw_footer(p, w, h, margin, footer_fields)
+                    dest_rect = pymupdf.Rect(margin, cursor_y, margin + rw * scale, cursor_y + scaled_h)
+                    _place(page, r, dest_rect)
+                    cursor_y = cursor_y + scaled_h + spacing
+
+    for page_number in all_pages:
+        _draw_footer(out[page_number], w, h, margin, footer_fields)
 
     buf = out.tobytes()
     out.close()
@@ -865,19 +916,24 @@ with st.sidebar:
     st.header("Output Settings")
     paper_key = st.selectbox("Paper size", list(PAPER_SIZES_PT.keys()))
     orientation = st.radio("Orientation", ["Portrait", "Landscape"], horizontal=True)
-    layout_options = ["Squeeze onto one sheet", "Natural size (multiple sheets)"]
+    layout_options = ["Squeeze each sheet onto one page", "Natural size (one project per sheet)"]
     if HAS_CANVAS:
         layout_options.append("Manual layout (drag & resize)")
     layout_mode = st.radio(
         "Layout",
         layout_options,
         index=0,
-        help="'Squeeze onto one sheet' shrinks everything checked below, as "
-             "a group, to the largest uniform scale that still fits all of "
-             "it on a single page. 'Natural size' places each item at full "
-             "scale and flows onto additional pages as needed. 'Manual "
-             "layout' lets you drag and resize each item yourself before "
-             "exporting.",
+        help="Each input sheet (page) is its own project and gets its own "
+             "output page(s) -- items from two different sheets are never "
+             "combined onto the same output page. 'Squeeze each sheet onto "
+             "one page' shrinks everything checked on a given sheet, as a "
+             "group, to the largest uniform scale that still fits that "
+             "sheet on a single output page. 'Natural size' places each "
+             "item at full scale and flows onto additional output pages "
+             "only if that same sheet's items don't all fit on one. "
+             "'Manual layout' lets you drag and resize each item yourself "
+             "before exporting, across the whole current selection on one "
+             "page.",
     )
     single_page = layout_mode.startswith("Squeeze")
     manual_layout = layout_mode.startswith("Manual")
@@ -964,34 +1020,47 @@ if st.session_state.pdf_bytes is not None:
         )
 
         if st.button("🔍 Detect Schedules / Views / Notes", type="primary"):
-            with st.spinner("Scanning sheet layout..."):
-                try:
-                    regions = detect_all_pages(st.session_state.pdf_bytes, pages_to_scan)
-                    cache = _load_cache()
-                    saved_includes = cache.get(st.session_state.pdf_hash, {}).get("regions", {})
-                    rows = [{
-                        "Include": bool(saved_includes.get(
-                            _region_key(r["page"] + 1, r["kind"], r["title"]), False)),
-                        "Page": r["page"] + 1, "Kind": r["kind"], "Title": r["title"],
-                        "X0": round(r["bbox"][0], 1), "Y0": round(r["bbox"][1], 1),
-                        "X1": round(r["bbox"][2], 1), "Y1": round(r["bbox"][3], 1),
-                    } for r in regions]
-                    st.session_state.regions_df = pd.DataFrame(rows)
-                    st.session_state.detected = True
-                    if not rows:
-                        st.warning("No schedules, views, or notes were detected on the selected page(s). "
-                                   "You can still add regions manually in the table below.")
-                    else:
-                        n_restored = sum(1 for r in rows if r["Include"])
-                        msg = f"Found {len(rows)} region(s), all unchecked by default."
-                        if n_restored:
-                            msg = (f"Found {len(rows)} region(s) -- restored {n_restored} "
-                                   f"checkmark(s) you'd saved for this file previously.")
-                        st.success(msg)
-                except Exception as e:
-                    st.error(f"Detection failed: {type(e).__name__}: {e}")
-                    with st.expander("Details"):
-                        st.code(traceback.format_exc())
+            progress_bar = st.progress(0.0, text=f"Scanning 0/{len(pages_to_scan)} sheet(s)...")
+
+            def _report_progress(done, total):
+                progress_bar.progress(done / total, text=f"Scanning {done}/{total} sheet(s)...")
+
+            try:
+                regions, page_errors = detect_all_pages(
+                    st.session_state.pdf_bytes, pages_to_scan, on_progress=_report_progress
+                )
+                progress_bar.empty()
+                cache = _load_cache()
+                saved_includes = cache.get(st.session_state.pdf_hash, {}).get("regions", {})
+                rows = [{
+                    "Include": bool(saved_includes.get(
+                        _region_key(r["page"] + 1, r["kind"], r["title"]), False)),
+                    "Page": r["page"] + 1, "Kind": r["kind"], "Title": r["title"],
+                    "X0": round(r["bbox"][0], 1), "Y0": round(r["bbox"][1], 1),
+                    "X1": round(r["bbox"][2], 1), "Y1": round(r["bbox"][3], 1),
+                } for r in regions]
+                st.session_state.regions_df = pd.DataFrame(rows)
+                st.session_state.detected = True
+                if page_errors:
+                    bad_pages = ", ".join(str(p) for p, _ in page_errors)
+                    st.warning(f"{len(page_errors)} sheet(s) failed to scan and were skipped "
+                               f"(page {bad_pages}). Every other sheet's results below are still "
+                               "usable -- add regions manually for the skipped ones if needed.")
+                if not rows:
+                    st.warning("No schedules, views, or notes were detected on the selected page(s). "
+                               "You can still add regions manually in the table below.")
+                else:
+                    n_restored = sum(1 for r in rows if r["Include"])
+                    msg = f"Found {len(rows)} region(s), all unchecked by default."
+                    if n_restored:
+                        msg = (f"Found {len(rows)} region(s) -- restored {n_restored} "
+                               f"checkmark(s) you'd saved for this file previously.")
+                    st.success(msg)
+            except Exception as e:
+                progress_bar.empty()
+                st.error(f"Detection failed: {type(e).__name__}: {e}")
+                with st.expander("Details"):
+                    st.code(traceback.format_exc())
 
         if st.session_state.detected or not st.session_state.regions_df.empty:
             st.subheader("Preview")
@@ -1169,7 +1238,7 @@ if st.session_state.pdf_bytes is not None:
                                 single_page=single_page, footer_fields=footer_fields,
                             )
                         base = os.path.splitext(st.session_state.pdf_name or "sheet")[0]
-                        mode_tag = "MANUAL" if manual_layout else ("ONEPAGE" if single_page else "MULTIPAGE")
+                        mode_tag = "MANUAL" if manual_layout else ("SQUEEZE" if single_page else "NATURAL")
                         out_name = f"{base}_SELECTED_{paper_key.split(' ')[0]}_{orientation}_{mode_tag}.pdf"
                         with pymupdf.open(stream=out_bytes, filetype="pdf") as _chk:
                             n_out_pages = len(_chk)
