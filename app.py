@@ -531,16 +531,13 @@ def _find_value_near_label(spans, label_kw, pad=25):
     return max(cands, key=lambda s: s["size"])["text"].strip()
 
 
-def extract_title_block_fields(pdf_bytes, page_index=0):
-    """Best-effort auto-detect of Drawing Name / Drawing No / Project Name
-    from a Revit-style title block (works even when that block's text is
-    rotated 90 degrees along a vertical sheet edge). Any field it can't
-    confidently find is returned as an empty string -- the UI lets you
-    correct these before export."""
+def _extract_title_block_fields_from_page(page):
+    """Core extraction logic, operating on an already-open PyMuPDF page --
+    every sheet has its own Drawing Name / Drawing No, so this gets called
+    once per exported sheet (via an already-open document) rather than
+    re-opening the whole PDF per sheet."""
     result = {"drawing_name": "", "drawing_no": "", "project_name": ""}
     try:
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        page = doc[page_index]
         page_w, page_h = page.rect.width, page.rect.height
         d = page.get_text("dict")
         spans = []
@@ -549,7 +546,6 @@ def extract_title_block_fields(pdf_bytes, page_index=0):
                 for span in line["spans"]:
                     if span["text"].strip():
                         spans.append({"text": span["text"], "bbox": span["bbox"], "size": span["size"]})
-        doc.close()
 
         dn = _find_value_near_label(spans, "DRAWING NAME")
         dno = _find_value_near_label(spans, "DRAWING NO")
@@ -585,6 +581,21 @@ def extract_title_block_fields(pdf_bytes, page_index=0):
     except Exception:
         pass
     return result
+
+
+def extract_title_block_fields(pdf_bytes, page_index=0):
+    """Best-effort auto-detect of Drawing Name / Drawing No / Project Name
+    from a Revit-style title block (works even when that block's text is
+    rotated 90 degrees along a vertical sheet edge). Any field it can't
+    confidently find is returned as an empty string -- the UI lets you
+    correct these before export."""
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        result = _extract_title_block_fields_from_page(doc[page_index])
+        doc.close()
+        return result
+    except Exception:
+        return {"drawing_name": "", "drawing_no": "", "project_name": ""}
 
 
 # ============================================================
@@ -674,8 +685,8 @@ def _draw_footer(page, w, h, margin, footer_fields):
 def _group_by_sheet(regions):
     """Groups regions by their source sheet (input Page), preserving the
     order sheets first appear in. Each group becomes its own project --
-    one sheet in, one output page (or natural-flow run of pages) out --
-    so items from different sheets never end up sharing an output page."""
+    one sheet in, one output page out -- so items from different sheets
+    never end up sharing an output page."""
     sheets = {}
     order = []
     for r in regions:
@@ -688,19 +699,24 @@ def _group_by_sheet(regions):
 
 
 def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
-                      margin=36, spacing=18, single_page=True, footer_fields=None,
+                      margin=36, spacing=18, footer_fields=None,
                       manual_dest=None):
     """Each source sheet (input PDF page) is treated as its own project:
-    every sheet gets its own output page (in 'squeeze' mode) or its own
-    natural-flow run of output page(s) -- items from two different sheets
-    are never packed onto the same output page together.
+    every sheet gets its own output page, squeezed to a uniform scale that
+    fits everything checked on it -- items from two different sheets are
+    never packed onto the same output page together. Every sheet keeps its
+    own Drawing Name / Drawing No in the footer (read fresh from that
+    sheet's own title block); only Project Name is shared across all pages,
+    from footer_fields. All the resulting pages land in one combined PDF.
 
     manual_dest, if given, is a list (same length/order as selected_regions)
     of dicts {'x','y','w','h'} in PDF points on a single page -- this is the
     exact placement the user dragged/resized in the layout editor for the
     current full selection, and overrides the automatic squeeze/flow
     packing entirely (it does not do the one-page-per-sheet grouping below,
-    since the layout editor works on one combined canvas)."""
+    since the layout editor works on one combined canvas, so its footer
+    falls back to the global Drawing Name/No in footer_fields since there's
+    no single source sheet to read them from)."""
     w, h = PAPER_SIZES_PT[paper_key]
     if orientation == "Landscape":
         w, h = h, w
@@ -712,13 +728,14 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
     content_h = h - 2 * margin
 
     valid_regions = [r for r in selected_regions if (r["X1"] - r["X0"]) > 0 and (r["Y1"] - r["Y0"]) > 0]
-    # Track page *numbers*, not the Page objects themselves: PyMuPDF orphans
-    # earlier Page wrappers (parent becomes None) as soon as another page is
-    # added to the document, so holding onto e.g. page 1's object while
-    # pages 2-72 get created and then drawing on it later raises
-    # "AttributeError: 'NoneType' object has no attribute 'is_pdf'". Numbers
-    # stay valid; re-fetch each one fresh via out[n] once everything is built.
-    all_pages = []
+    # Track page *numbers* (and each one's source sheet), not the Page
+    # objects themselves: PyMuPDF orphans earlier Page wrappers (parent
+    # becomes None) as soon as another page is added to the document, so
+    # holding onto e.g. page 1's object while pages 2-72 get created and
+    # then drawing on it later raises "AttributeError: 'NoneType' object
+    # has no attribute 'is_pdf'". Numbers stay valid; re-fetch each one
+    # fresh via out[n] once everything is built.
+    all_pages = []  # list of (out_page_number, source_sheet_page_or_None)
 
     def _place(page, r, dest_rect):
         src_bbox = pymupdf.Rect(r["X0"], r["Y0"], r["X1"], r["Y1"])
@@ -729,7 +746,7 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
 
     if manual_dest is not None:
         page = out.new_page(width=w, height=h)
-        all_pages.append(page.number)
+        all_pages.append((page.number, None))
         for r, dest in zip(selected_regions, manual_dest):
             if (r["X1"] - r["X0"]) <= 0 or (r["Y1"] - r["Y0"]) <= 0:
                 continue
@@ -739,54 +756,33 @@ def build_output_pdf(pdf_bytes, selected_regions, paper_key, orientation,
             _place(page, r, dest_rect)
     else:
         for sheet_regions in _group_by_sheet(valid_regions):
-            if single_page:
-                # Squeeze this sheet's items onto a single output page:
-                # binary-search a uniform scale small enough that a greedy
-                # row-pack of the sheet's items fits within one page.
-                scale = _best_single_page_scale(sheet_regions, content_w, content_h, spacing)
-                rows, _ = _shelf_pack(sheet_regions, content_w, content_h, spacing, scale)
-                page = out.new_page(width=w, height=h)
-                all_pages.append(page.number)
-                cursor_y = margin
-                for row_h, items in rows:
-                    cursor_x = margin
-                    for r, sw, sh in items:
-                        dest_rect = pymupdf.Rect(cursor_x, cursor_y, cursor_x + sw, cursor_y + sh)
-                        _place(page, r, dest_rect)
-                        cursor_x += sw + spacing
-                    cursor_y += row_h + spacing
-            else:
-                # Natural size, flowing onto as many pages as this one sheet
-                # needs (a new sheet always starts on a fresh output page).
-                page = out.new_page(width=w, height=h)
-                all_pages.append(page.number)
-                cursor_y = margin
-                for r in sheet_regions:
-                    rw, rh = r["X1"] - r["X0"], r["Y1"] - r["Y0"]
-
-                    scale = content_w / rw
-                    scaled_h = rh * scale
-                    if scaled_h > content_h:
-                        scale = content_h / rh
-                        scaled_h = rh * scale
-
-                    remaining = margin + content_h - cursor_y
-                    if cursor_y > margin and scaled_h > remaining:
-                        page = out.new_page(width=w, height=h)
-                        all_pages.append(page.number)
-                        cursor_y = margin
-                        scale = content_w / rw
-                        scaled_h = rh * scale
-                        if scaled_h > content_h:
-                            scale = content_h / rh
-                            scaled_h = rh * scale
-
-                    dest_rect = pymupdf.Rect(margin, cursor_y, margin + rw * scale, cursor_y + scaled_h)
+            # Squeeze this sheet's items onto a single output page:
+            # binary-search a uniform scale small enough that a greedy
+            # row-pack of the sheet's items fits within one page.
+            scale = _best_single_page_scale(sheet_regions, content_w, content_h, spacing)
+            rows, _ = _shelf_pack(sheet_regions, content_w, content_h, spacing, scale)
+            page = out.new_page(width=w, height=h)
+            all_pages.append((page.number, int(sheet_regions[0]["Page"])))
+            cursor_y = margin
+            for row_h, items in rows:
+                cursor_x = margin
+                for r, sw, sh in items:
+                    dest_rect = pymupdf.Rect(cursor_x, cursor_y, cursor_x + sw, cursor_y + sh)
                     _place(page, r, dest_rect)
-                    cursor_y = cursor_y + scaled_h + spacing
+                    cursor_x += sw + spacing
+                cursor_y += row_h + spacing
 
-    for page_number in all_pages:
-        _draw_footer(out[page_number], w, h, margin, footer_fields)
+    for page_number, source_page in all_pages:
+        page_footer = dict(footer_fields)
+        if source_page is not None:
+            per_sheet = _extract_title_block_fields_from_page(src[source_page - 1])
+            # fall back to the global sidebar value if this sheet's own
+            # title block couldn't be read (detection is best-effort)
+            if per_sheet.get("drawing_name"):
+                page_footer["drawing_name"] = per_sheet["drawing_name"]
+            if per_sheet.get("drawing_no"):
+                page_footer["drawing_no"] = per_sheet["drawing_no"]
+        _draw_footer(out[page_number], w, h, margin, page_footer)
 
     buf = out.tobytes()
     out.close()
@@ -981,7 +977,7 @@ with st.sidebar:
     st.header("Output Settings")
     paper_key = st.selectbox("Paper size", list(PAPER_SIZES_PT.keys()))
     orientation = st.radio("Orientation", ["Portrait", "Landscape"], horizontal=True)
-    layout_options = ["Squeeze each sheet onto one page", "Natural size (one project per sheet)"]
+    layout_options = ["Squeeze each sheet onto one page"]
     if HAS_CANVAS:
         layout_options.append("Manual layout (drag & resize)")
     layout_mode = st.radio(
@@ -989,18 +985,14 @@ with st.sidebar:
         layout_options,
         index=0,
         help="Each input sheet (page) is its own project and gets its own "
-             "output page(s) -- items from two different sheets are never "
+             "output page -- items from two different sheets are never "
              "combined onto the same output page. 'Squeeze each sheet onto "
              "one page' shrinks everything checked on a given sheet, as a "
              "group, to the largest uniform scale that still fits that "
-             "sheet on a single output page. 'Natural size' places each "
-             "item at full scale and flows onto additional output pages "
-             "only if that same sheet's items don't all fit on one. "
-             "'Manual layout' lets you drag and resize each item yourself "
-             "before exporting, across the whole current selection on one "
-             "page.",
+             "sheet on a single output page. 'Manual layout' lets you drag "
+             "and resize each item yourself before exporting, across the "
+             "whole current selection on one page.",
     )
-    single_page = layout_mode.startswith("Squeeze")
     manual_layout = layout_mode.startswith("Manual")
     if not HAS_CANVAS:
         st.caption("Tip: `pip install streamlit-drawable-canvas` to unlock a "
@@ -1046,12 +1038,18 @@ if st.session_state.pdf_bytes is not None:
 
     with st.sidebar:
         st.header("Footer")
-        st.caption("Printed along the bottom of every exported page. Auto-filled "
-                   "from the title block where possible -- correct anything that's "
-                   "off; it's remembered next time you open this same PDF.")
+        st.caption(
+            "Printed along the bottom of every exported page. Project Name is shared "
+            "across every sheet. Drawing Name and Drawing No. are normally read fresh "
+            "from each sheet's own title block, so every output page gets its correct "
+            "value automatically -- the fields below are only a fallback, used if a "
+            "particular sheet's title block can't be read."
+        )
         st.session_state.project_name = st.text_input("Project Name", st.session_state.project_name)
-        st.session_state.drawing_name = st.text_input("Drawing Name", st.session_state.drawing_name)
-        st.session_state.drawing_no = st.text_input("Drawing No.", st.session_state.drawing_no)
+        st.session_state.drawing_name = st.text_input(
+            "Drawing Name (fallback)", st.session_state.drawing_name)
+        st.session_state.drawing_no = st.text_input(
+            "Drawing No. (fallback)", st.session_state.drawing_no)
 
 
 def _persist_current_state():
@@ -1355,10 +1353,10 @@ if st.session_state.pdf_bytes is not None:
                             out_bytes = build_output_pdf(
                                 st.session_state.pdf_bytes, selected_rows,
                                 paper_key, orientation, margin=margin, spacing=spacing,
-                                single_page=single_page, footer_fields=footer_fields,
+                                footer_fields=footer_fields,
                             )
                         base = os.path.splitext(st.session_state.pdf_name or "sheet")[0]
-                        mode_tag = "MANUAL" if manual_layout else ("SQUEEZE" if single_page else "NATURAL")
+                        mode_tag = "MANUAL" if manual_layout else "SQUEEZE"
                         out_name = f"{base}_SELECTED_{paper_key.split(' ')[0]}_{orientation}_{mode_tag}.pdf"
                         with pymupdf.open(stream=out_bytes, filetype="pdf") as _chk:
                             n_out_pages = len(_chk)
