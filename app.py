@@ -100,24 +100,26 @@ def _save_cache(cache):
 # ============================================================
 # Session state init (stability pattern)
 # ============================================================
-if "initialized" not in st.session_state:
-    st.session_state.initialized = True
-    st.session_state.regions_df = pd.DataFrame(
-        columns=["Include", "Page", "Kind", "Title", "X0", "Y0", "X1", "Y1"]
-    )
-    st.session_state.detected = False
-    st.session_state.pdf_bytes = None
-    st.session_state.pdf_name = None
-    st.session_state.pdf_hash = None
-    st.session_state.uploader_key = 0
-    st.session_state.drawing_name = ""
-    st.session_state.drawing_no = ""
-    st.session_state.project_name = ""
-    st.session_state.canvas_selection_key = None
-    st.session_state.canvas_initial = None
-    st.session_state.canvas_region_order = []
+# Same guard as below -- see the comment above the st.title() block.
+if __name__ == "__main__":
+    if "initialized" not in st.session_state:
+        st.session_state.initialized = True
+        st.session_state.regions_df = pd.DataFrame(
+            columns=["Include", "Page", "Kind", "Title", "X0", "Y0", "X1", "Y1"]
+        )
+        st.session_state.detected = False
+        st.session_state.pdf_bytes = None
+        st.session_state.pdf_name = None
+        st.session_state.pdf_hash = None
+        st.session_state.uploader_key = 0
+        st.session_state.drawing_name = ""
+        st.session_state.drawing_no = ""
+        st.session_state.project_name = ""
+        st.session_state.canvas_selection_key = None
+        st.session_state.canvas_initial = None
+        st.session_state.canvas_region_order = []
 
-st.set_page_config(page_title="Sheet Region Exporter", layout="wide")
+    st.set_page_config(page_title="Sheet Region Exporter", layout="wide")
 
 # ============================================================
 # Constants / tunables
@@ -741,471 +743,475 @@ def parse_page_range_spec(spec, n_pages):
 # ============================================================
 # UI
 # ============================================================
-st.title("📐 Sheet Region Exporter")
-st.caption(
-    "Upload a drawing sheet PDF. Schedules, views, and the notes block are "
-    "auto-detected on every sheet. Sheets sharing the exact same set of "
-    "view/schedule names are grouped into one project -- check what you want "
-    "once per group and it's applied to every sheet in it -- then export "
-    "onto a new PDF (one output page per sheet) at whatever paper size you need."
-)
-
-with st.sidebar:
-    st.header("Output Settings")
-    paper_key = st.selectbox("Paper size", list(PAPER_SIZES_PT.keys()))
-    orientation = st.radio("Orientation", ["Portrait", "Landscape"], horizontal=True)
-    layout_options = ["Squeeze each sheet onto one page"]
-    if HAS_CANVAS:
-        layout_options.append("Manual layout (drag & resize)")
-    layout_mode = st.radio(
-        "Layout",
-        layout_options,
-        index=0,
-        help="Each input sheet (page) is its own project and gets its own "
-             "output page -- items from two different sheets are never "
-             "combined onto the same output page. 'Squeeze each sheet onto "
-             "one page' shrinks everything checked on a given sheet, as a "
-             "group, to the largest uniform scale that still fits that "
-             "sheet on a single output page. 'Manual layout' lets you drag "
-             "and resize each item yourself before exporting, across the "
-             "whole current selection on one page.",
+# Guarded so a spawned multiprocessing worker re-importing this module
+# (run_name='__mp_main__', not '__main__') skips the whole interactive app
+# body instead of re-running every Streamlit call with no real session.
+if __name__ == "__main__":
+    st.title("📐 Sheet Region Exporter")
+    st.caption(
+        "Upload a drawing sheet PDF. Schedules, views, and the notes block are "
+        "auto-detected on every sheet. Sheets sharing the exact same set of "
+        "view/schedule names are grouped into one project -- check what you want "
+        "once per group and it's applied to every sheet in it -- then export "
+        "onto a new PDF (one output page per sheet) at whatever paper size you need."
     )
-    manual_layout = layout_mode.startswith("Manual")
-    if not HAS_CANVAS:
-        st.caption("Tip: `pip install streamlit-drawable-canvas` to unlock a "
-                   "drag-and-resize layout mode.")
-    with st.expander("Advanced layout"):
-        margin = st.number_input("Margin (pt)", min_value=0, max_value=144, value=36, step=6)
-        spacing = st.number_input("Spacing between items (pt)", min_value=0, max_value=72, value=18, step=6)
-
-uploaded = st.file_uploader("📄 Upload sheet PDF", type=["pdf"], key=f"uploader_{st.session_state.uploader_key}")
-
-if uploaded is not None:
-    pdf_bytes = uploaded.read()
-    if st.session_state.pdf_bytes != pdf_bytes:
-        st.session_state.pdf_bytes = pdf_bytes
-        st.session_state.pdf_name = uploaded.name
-        st.session_state.pdf_hash = _pdf_hash(pdf_bytes)
-        st.session_state.detected = False
-        st.session_state.regions_df = pd.DataFrame(
-            columns=["Include", "Page", "Kind", "Title", "X0", "Y0", "X1", "Y1"]
-        )
-
-        cache = _load_cache()
-        entry = cache.get(st.session_state.pdf_hash, {})
-        saved_footer = entry.get("footer", {})
-        if saved_footer:
-            # We've seen this exact file before -- restore what was typed last time.
-            st.session_state.drawing_name = saved_footer.get("drawing_name", "")
-            st.session_state.drawing_no = saved_footer.get("drawing_no", "")
-            st.session_state.project_name = saved_footer.get("project_name", "")
-        else:
-            guessed = extract_title_block_fields(pdf_bytes)
-            st.session_state.drawing_name = guessed["drawing_name"]
-            st.session_state.drawing_no = guessed["drawing_no"]
-            st.session_state.project_name = guessed["project_name"]
-
-if st.session_state.pdf_bytes is not None:
-    try:
-        with pdfplumber.open(io.BytesIO(st.session_state.pdf_bytes)) as _pdf:
-            n_pages = len(_pdf.pages)
-    except Exception as e:
-        st.error(f"Couldn't open that PDF: {e}")
-        n_pages = 0
 
     with st.sidebar:
-        st.header("Footer")
-        st.caption(
-            "Printed along the bottom of every exported page. Project Name is shared "
-            "across every sheet. Drawing Name and Drawing No. are normally read fresh "
-            "from each sheet's own title block, so every output page gets its correct "
-            "value automatically -- the fields below are only a fallback, used if a "
-            "particular sheet's title block can't be read."
+        st.header("Output Settings")
+        paper_key = st.selectbox("Paper size", list(PAPER_SIZES_PT.keys()))
+        orientation = st.radio("Orientation", ["Portrait", "Landscape"], horizontal=True)
+        layout_options = ["Squeeze each sheet onto one page"]
+        if HAS_CANVAS:
+            layout_options.append("Manual layout (drag & resize)")
+        layout_mode = st.radio(
+            "Layout",
+            layout_options,
+            index=0,
+            help="Each input sheet (page) is its own project and gets its own "
+                 "output page -- items from two different sheets are never "
+                 "combined onto the same output page. 'Squeeze each sheet onto "
+                 "one page' shrinks everything checked on a given sheet, as a "
+                 "group, to the largest uniform scale that still fits that "
+                 "sheet on a single output page. 'Manual layout' lets you drag "
+                 "and resize each item yourself before exporting, across the "
+                 "whole current selection on one page.",
         )
-        st.session_state.project_name = st.text_input("Project Name", st.session_state.project_name)
-        st.session_state.drawing_name = st.text_input(
-            "Drawing Name (fallback)", st.session_state.drawing_name)
-        st.session_state.drawing_no = st.text_input(
-            "Drawing No. (fallback)", st.session_state.drawing_no)
+        manual_layout = layout_mode.startswith("Manual")
+        if not HAS_CANVAS:
+            st.caption("Tip: `pip install streamlit-drawable-canvas` to unlock a "
+                       "drag-and-resize layout mode.")
+        with st.expander("Advanced layout"):
+            margin = st.number_input("Margin (pt)", min_value=0, max_value=144, value=36, step=6)
+            spacing = st.number_input("Spacing between items (pt)", min_value=0, max_value=72, value=18, step=6)
 
+    uploaded = st.file_uploader("📄 Upload sheet PDF", type=["pdf"], key=f"uploader_{st.session_state.uploader_key}")
 
-def _persist_current_state():
-    """Saves checkbox states + footer field values for the current PDF so
-    they're recalled next time this same file is opened."""
-    if not st.session_state.get("pdf_hash"):
-        return
-    cache = _load_cache()
-    entry = cache.setdefault(st.session_state.pdf_hash, {})
-    entry["footer"] = {
-        "drawing_name": st.session_state.drawing_name,
-        "drawing_no": st.session_state.drawing_no,
-        "project_name": st.session_state.project_name,
-    }
-    regions_map = {}
-    for _, row in st.session_state.regions_df.iterrows():
-        key = _region_key(int(row["Page"]), row["Kind"], row["Title"])
-        regions_map[key] = bool(row["Include"])
-    entry["regions"] = regions_map
-    cache[st.session_state.pdf_hash] = entry
-    _save_cache(cache)
-
-
-if st.session_state.pdf_bytes is not None:
-    _persist_current_state()
-
-    if n_pages:
-        if n_pages == 1:
-            pages_to_scan = [1]
-        else:
-            page_spec = st.text_input(
-                "Pages to scan",
-                value="all",
-                help="Type 'all' to scan every page, a single range like 2-71, "
-                     "or a comma-separated mix of pages/ranges like 2-10, 13-15.",
+    if uploaded is not None:
+        pdf_bytes = uploaded.read()
+        if st.session_state.pdf_bytes != pdf_bytes:
+            st.session_state.pdf_bytes = pdf_bytes
+            st.session_state.pdf_name = uploaded.name
+            st.session_state.pdf_hash = _pdf_hash(pdf_bytes)
+            st.session_state.detected = False
+            st.session_state.regions_df = pd.DataFrame(
+                columns=["Include", "Page", "Kind", "Title", "X0", "Y0", "X1", "Y1"]
             )
-            try:
-                pages_to_scan = parse_page_range_spec(page_spec, n_pages)
-                if not pages_to_scan:
-                    st.warning("No pages selected -- type 'all' or a range like 2-71.")
-                else:
-                    st.caption(f"Will scan {len(pages_to_scan)} page(s): "
-                               f"{_format_page_ranges(pages_to_scan)}")
-            except ValueError as e:
-                st.error(str(e))
-                pages_to_scan = []
 
-        force_rescan = st.checkbox(
-            "Force re-scan (ignore cached results from a previous Detect run)",
-            value=False,
-            help="Detection results are cached per page for this file. Leave this unchecked "
-                 "to re-run Detect quickly after only changing the page range above -- "
-                 "already-scanned pages are reused instead of re-processed. Check this if "
-                 "you've edited the PDF itself, or want to redo detection from scratch.",
-        )
+            cache = _load_cache()
+            entry = cache.get(st.session_state.pdf_hash, {})
+            saved_footer = entry.get("footer", {})
+            if saved_footer:
+                # We've seen this exact file before -- restore what was typed last time.
+                st.session_state.drawing_name = saved_footer.get("drawing_name", "")
+                st.session_state.drawing_no = saved_footer.get("drawing_no", "")
+                st.session_state.project_name = saved_footer.get("project_name", "")
+            else:
+                guessed = extract_title_block_fields(pdf_bytes)
+                st.session_state.drawing_name = guessed["drawing_name"]
+                st.session_state.drawing_no = guessed["drawing_no"]
+                st.session_state.project_name = guessed["project_name"]
 
-        if st.button("🔍 Detect Schedules / Views / Notes", type="primary", disabled=not pages_to_scan):
-            progress_bar = st.progress(0.0, text=f"Scanning 0/{len(pages_to_scan)} sheet(s)...")
+    if st.session_state.pdf_bytes is not None:
+        try:
+            with pdfplumber.open(io.BytesIO(st.session_state.pdf_bytes)) as _pdf:
+                n_pages = len(_pdf.pages)
+        except Exception as e:
+            st.error(f"Couldn't open that PDF: {e}")
+            n_pages = 0
 
-            def _report_progress(done, total):
-                progress_bar.progress(done / total, text=f"Scanning {done}/{total} sheet(s)...")
-
-            try:
-                cache = _load_cache()
-                entry = cache.get(st.session_state.pdf_hash, {})
-                page_cache = entry.get("page_regions", {})
-                n_cached_before = sum(1 for pno in pages_to_scan if str(pno) in page_cache) if not force_rescan else 0
-
-                regions, page_errors, updated_page_cache = detect_all_pages(
-                    st.session_state.pdf_bytes, pages_to_scan,
-                    on_progress=_report_progress, page_cache=page_cache, force_rescan=force_rescan,
-                )
-                progress_bar.empty()
-
-                # persist the (now larger) per-page detection cache
-                cache = _load_cache()
-                entry = cache.setdefault(st.session_state.pdf_hash, {})
-                entry["page_regions"] = updated_page_cache
-                cache[st.session_state.pdf_hash] = entry
-                _save_cache(cache)
-
-                saved_includes = entry.get("regions", {})
-                rows = [{
-                    "Include": bool(saved_includes.get(
-                        _region_key(r["page"] + 1, r["kind"], r["title"]), False)),
-                    "Page": r["page"] + 1, "Kind": r["kind"], "Title": r["title"],
-                    "X0": round(r["bbox"][0], 1), "Y0": round(r["bbox"][1], 1),
-                    "X1": round(r["bbox"][2], 1), "Y1": round(r["bbox"][3], 1),
-                } for r in regions]
-                # pages now finish scanning in whatever order threads complete
-                # them, not the order they were requested in -- restore
-                # reading order (page, then top-to-bottom, then left-to-right)
-                rows.sort(key=lambda r: (r["Page"], round(r["Y0"] / 40), r["X0"]))
-                st.session_state.regions_df = pd.DataFrame(rows)
-                st.session_state.detected = True
-                if page_errors:
-                    bad_pages = ", ".join(str(p) for p, _ in page_errors)
-                    st.warning(f"{len(page_errors)} sheet(s) failed to scan and were skipped "
-                               f"(page {bad_pages}). Every other sheet's results below are still "
-                               "usable -- add regions manually for the skipped ones if needed.")
-                if not rows:
-                    st.warning("No schedules, views, or notes were detected on the selected page(s). "
-                               "You can still add regions manually in the table below.")
-                else:
-                    n_restored = sum(1 for r in rows if r["Include"])
-                    msg = f"Found {len(rows)} region(s)"
-                    if n_cached_before:
-                        msg += f" -- reused cached results for {n_cached_before} already-scanned page(s)"
-                    msg += ", all unchecked by default." if not n_restored else "."
-                    if n_restored:
-                        msg += (f" Restored {n_restored} checkmark(s) you'd saved for this "
-                                "file previously.")
-                    st.success(msg)
-            except Exception as e:
-                progress_bar.empty()
-                st.error(f"Detection failed: {type(e).__name__}: {e}")
-                with st.expander("Details"):
-                    st.code(traceback.format_exc())
-
-        if st.session_state.detected or not st.session_state.regions_df.empty:
-            st.subheader("Preview")
-            preview_page = st.selectbox(
-                "Page to preview", pages_to_scan, format_func=lambda p: f"Page {p}"
-            ) if len(pages_to_scan) > 1 else pages_to_scan[0]
-
-            df_now = st.session_state.regions_df
-            page_regions = []
-            for _, row in df_now.iterrows():
-                if int(row["Page"]) == preview_page:
-                    page_regions.append({
-                        "kind": row["Kind"], "title": row["Title"],
-                        "bbox": (row["X0"], row["Y0"], row["X1"], row["Y1"]),
-                    })
-            try:
-                img = render_preview_image(st.session_state.pdf_bytes, preview_page - 1, page_regions)
-                st.image(img, use_container_width=True)
-            except Exception as e:
-                st.error(f"Couldn't render preview: {e}")
-
-            st.subheader("Sheet Groups")
+        with st.sidebar:
+            st.header("Footer")
             st.caption(
-                "Sheets with the exact same set of view/schedule names are treated as one "
-                "repeatable project: check the ones you want from a group once below, and "
-                "that selection is applied to every sheet in that group automatically."
+                "Printed along the bottom of every exported page. Project Name is shared "
+                "across every sheet. Drawing Name and Drawing No. are normally read fresh "
+                "from each sheet's own title block, so every output page gets its correct "
+                "value automatically -- the fields below are only a fallback, used if a "
+                "particular sheet's title block can't be read."
+            )
+            st.session_state.project_name = st.text_input("Project Name", st.session_state.project_name)
+            st.session_state.drawing_name = st.text_input(
+                "Drawing Name (fallback)", st.session_state.drawing_name)
+            st.session_state.drawing_no = st.text_input(
+                "Drawing No. (fallback)", st.session_state.drawing_no)
+
+
+    def _persist_current_state():
+        """Saves checkbox states + footer field values for the current PDF so
+        they're recalled next time this same file is opened."""
+        if not st.session_state.get("pdf_hash"):
+            return
+        cache = _load_cache()
+        entry = cache.setdefault(st.session_state.pdf_hash, {})
+        entry["footer"] = {
+            "drawing_name": st.session_state.drawing_name,
+            "drawing_no": st.session_state.drawing_no,
+            "project_name": st.session_state.project_name,
+        }
+        regions_map = {}
+        for _, row in st.session_state.regions_df.iterrows():
+            key = _region_key(int(row["Page"]), row["Kind"], row["Title"])
+            regions_map[key] = bool(row["Include"])
+        entry["regions"] = regions_map
+        cache[st.session_state.pdf_hash] = entry
+        _save_cache(cache)
+
+
+    if st.session_state.pdf_bytes is not None:
+        _persist_current_state()
+
+        if n_pages:
+            if n_pages == 1:
+                pages_to_scan = [1]
+            else:
+                page_spec = st.text_input(
+                    "Pages to scan",
+                    value="all",
+                    help="Type 'all' to scan every page, a single range like 2-71, "
+                         "or a comma-separated mix of pages/ranges like 2-10, 13-15.",
+                )
+                try:
+                    pages_to_scan = parse_page_range_spec(page_spec, n_pages)
+                    if not pages_to_scan:
+                        st.warning("No pages selected -- type 'all' or a range like 2-71.")
+                    else:
+                        st.caption(f"Will scan {len(pages_to_scan)} page(s): "
+                                   f"{_format_page_ranges(pages_to_scan)}")
+                except ValueError as e:
+                    st.error(str(e))
+                    pages_to_scan = []
+
+            force_rescan = st.checkbox(
+                "Force re-scan (ignore cached results from a previous Detect run)",
+                value=False,
+                help="Detection results are cached per page for this file. Leave this unchecked "
+                     "to re-run Detect quickly after only changing the page range above -- "
+                     "already-scanned pages are reused instead of re-processed. Check this if "
+                     "you've edited the PDF itself, or want to redo detection from scratch.",
             )
 
-            groups = group_sheets_by_signature(st.session_state.regions_df)
-            incomplete_flags = find_incomplete_sheets(groups)
-            for f in incomplete_flags:
-                missing_str = ", ".join(f"{k}: {t}" for k, t in f["missing"])
-                st.warning(
-                    f"Sheet(s) {_format_page_ranges(f['pages'])} look like they belong with "
-                    f"Group {f['closest_group_id']} but are missing: {missing_str}. They'll "
-                    "only export whatever was actually detected on them."
-                )
+            if st.button("🔍 Detect Schedules / Views / Notes", type="primary", disabled=not pages_to_scan):
+                progress_bar = st.progress(0.0, text=f"Scanning 0/{len(pages_to_scan)} sheet(s)...")
 
-            group_cache = _load_cache()
-            group_cache_entry = group_cache.setdefault(st.session_state.pdf_hash, {})
-            group_selections = group_cache_entry.setdefault("group_selections", {})
+                def _report_progress(done, total):
+                    progress_bar.progress(done / total, text=f"Scanning {done}/{total} sheet(s)...")
 
-            for g in groups:
-                sig_sorted = sorted(g["signature"])
-                saved = {tuple(x) for x in group_selections.get(g["key"], [])}
-                with st.container(border=True):
-                    st.markdown(f"**Group {g['id']}** -- {len(g['pages'])} sheet(s) "
-                                f"(page {_format_page_ranges(g['pages'])})")
-                    n_cols = min(len(sig_sorted), 4) or 1
-                    cols = st.columns(n_cols)
-                    checked = set()
-                    for i, (kind, title) in enumerate(sig_sorted):
-                        default = (kind, title) in saved
-                        val = cols[i % n_cols].checkbox(
-                            f"{kind}: {title}", value=default, key=f"grp_{g['key']}_{kind}_{title}"
-                        )
-                        if val:
-                            checked.add((kind, title))
+                try:
+                    cache = _load_cache()
+                    entry = cache.get(st.session_state.pdf_hash, {})
+                    page_cache = entry.get("page_regions", {})
+                    n_cached_before = sum(1 for pno in pages_to_scan if str(pno) in page_cache) if not force_rescan else 0
 
-                df = st.session_state.regions_df
-                mask = df["Page"].astype(int).isin(g["pages"])
-                for kind, title in sig_sorted:
-                    row_mask = mask & (df["Kind"] == kind) & (df["Title"] == title)
-                    df.loc[row_mask, "Include"] = (kind, title) in checked
-                st.session_state.regions_df = df
-                group_selections[g["key"]] = [list(t) for t in checked]
+                    regions, page_errors, updated_page_cache = detect_all_pages(
+                        st.session_state.pdf_bytes, pages_to_scan,
+                        on_progress=_report_progress, page_cache=page_cache, force_rescan=force_rescan,
+                    )
+                    progress_bar.empty()
 
-            group_cache[st.session_state.pdf_hash] = group_cache_entry
-            _save_cache(group_cache)
+                    # persist the (now larger) per-page detection cache
+                    cache = _load_cache()
+                    entry = cache.setdefault(st.session_state.pdf_hash, {})
+                    entry["page_regions"] = updated_page_cache
+                    cache[st.session_state.pdf_hash] = entry
+                    _save_cache(cache)
 
-            st.divider()
+                    saved_includes = entry.get("regions", {})
+                    rows = [{
+                        "Include": bool(saved_includes.get(
+                            _region_key(r["page"] + 1, r["kind"], r["title"]), False)),
+                        "Page": r["page"] + 1, "Kind": r["kind"], "Title": r["title"],
+                        "X0": round(r["bbox"][0], 1), "Y0": round(r["bbox"][1], 1),
+                        "X1": round(r["bbox"][2], 1), "Y1": round(r["bbox"][3], 1),
+                    } for r in regions]
+                    # pages now finish scanning in whatever order threads complete
+                    # them, not the order they were requested in -- restore
+                    # reading order (page, then top-to-bottom, then left-to-right)
+                    rows.sort(key=lambda r: (r["Page"], round(r["Y0"] / 40), r["X0"]))
+                    st.session_state.regions_df = pd.DataFrame(rows)
+                    st.session_state.detected = True
+                    if page_errors:
+                        bad_pages = ", ".join(str(p) for p, _ in page_errors)
+                        st.warning(f"{len(page_errors)} sheet(s) failed to scan and were skipped "
+                                   f"(page {bad_pages}). Every other sheet's results below are still "
+                                   "usable -- add regions manually for the skipped ones if needed.")
+                    if not rows:
+                        st.warning("No schedules, views, or notes were detected on the selected page(s). "
+                                   "You can still add regions manually in the table below.")
+                    else:
+                        n_restored = sum(1 for r in rows if r["Include"])
+                        msg = f"Found {len(rows)} region(s)"
+                        if n_cached_before:
+                            msg += f" -- reused cached results for {n_cached_before} already-scanned page(s)"
+                        msg += ", all unchecked by default." if not n_restored else "."
+                        if n_restored:
+                            msg += (f" Restored {n_restored} checkmark(s) you'd saved for this "
+                                    "file previously.")
+                        st.success(msg)
+                except Exception as e:
+                    progress_bar.empty()
+                    st.error(f"Detection failed: {type(e).__name__}: {e}")
+                    with st.expander("Details"):
+                        st.code(traceback.format_exc())
 
-            with st.expander("Fine-tune individual detections (advanced)"):
+            if st.session_state.detected or not st.session_state.regions_df.empty:
+                st.subheader("Preview")
+                preview_page = st.selectbox(
+                    "Page to preview", pages_to_scan, format_func=lambda p: f"Page {p}"
+                ) if len(pages_to_scan) > 1 else pages_to_scan[0]
+
+                df_now = st.session_state.regions_df
+                page_regions = []
+                for _, row in df_now.iterrows():
+                    if int(row["Page"]) == preview_page:
+                        page_regions.append({
+                            "kind": row["Kind"], "title": row["Title"],
+                            "bbox": (row["X0"], row["Y0"], row["X1"], row["Y1"]),
+                        })
+                try:
+                    img = render_preview_image(st.session_state.pdf_bytes, preview_page - 1, page_regions)
+                    st.image(img, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Couldn't render preview: {e}")
+
+                st.subheader("Sheet Groups")
                 st.caption(
-                    "Per-sheet detail, for the rare case a detection box or title needs a manual "
-                    "correction. Titles and box coordinates (in PDF points, top-left origin) are "
-                    "editable, and you can add or delete rows. Note: the Include checkbox here is "
-                    "normally driven by the Sheet Groups selections above -- toggling it manually is "
-                    "only a temporary override and will be replaced the next time a group checkbox "
-                    "changes or a Select All/Deselect All button runs."
-                )
-                colored_legend = " &nbsp; ".join(
-                    f'<span style="color:rgb{c}">■</span> {k}' for k, c in KIND_COLORS.items()
-                )
-                st.markdown(colored_legend, unsafe_allow_html=True)
-
-                edited = st.data_editor(
-                    st.session_state.regions_df,
-                    column_config={
-                        "Include": st.column_config.CheckboxColumn("Include", default=False),
-                        "Page": st.column_config.NumberColumn("Page", min_value=1, max_value=n_pages, step=1),
-                        "Kind": st.column_config.SelectboxColumn("Kind", options=["Schedule", "View", "Notes"]),
-                        "Title": st.column_config.TextColumn("Title", width="medium"),
-                        "X0": st.column_config.NumberColumn("X0", format="%.1f"),
-                        "Y0": st.column_config.NumberColumn("Y0", format="%.1f"),
-                        "X1": st.column_config.NumberColumn("X1", format="%.1f"),
-                        "Y1": st.column_config.NumberColumn("Y1", format="%.1f"),
-                    },
-                    num_rows="dynamic",
-                    use_container_width=True,
-                    key="editor_regions",
-                )
-                st.session_state.regions_df = edited
-                _persist_current_state()
-
-                col_a, col_b, col_c, _ = st.columns([1, 1, 1.6, 2.4])
-                with col_a:
-                    if st.button("Select All"):
-                        st.session_state.regions_df["Include"] = True
-                        _persist_current_state()
-                        st.rerun()
-                with col_b:
-                    if st.button("Deselect All"):
-                        st.session_state.regions_df["Include"] = False
-                        _persist_current_state()
-                        st.rerun()
-                with col_c:
-                    if st.button("Forget saved checks for this file"):
-                        cache = _load_cache()
-                        cache.pop(st.session_state.pdf_hash, None)
-                        _save_cache(cache)
-                        st.session_state.regions_df["Include"] = False
-                        st.rerun()
-
-            st.divider()
-            selected = st.session_state.regions_df[st.session_state.regions_df["Include"] == True]
-            st.write(f"**{len(selected)}** region(s) selected for export.")
-            selected_sorted = selected.sort_values(by=["Page", "Y0", "X0"])
-            selected_rows = selected_sorted.to_dict("records")
-
-            manual_dest_list = None
-            if manual_layout and not selected.empty:
-                st.subheader("Layout Editor")
-                st.caption(
-                    "Design the layout once, per named view/schedule -- drag an item to "
-                    "reposition it and drag a corner handle to resize it (hold Shift to keep "
-                    "proportions), or pick a column x row grid below and click Apply. This same "
-                    f"layout is then repeated as its own {paper_key.split(' ')[0]} "
-                    f"{orientation.lower()} output page for every sheet that has these items -- "
-                    "the light grey guide shows your margin."
+                    "Sheets with the exact same set of view/schedule names are treated as one "
+                    "repeatable project: check the ones you want from a group once below, and "
+                    "that selection is applied to every sheet in that group automatically."
                 )
 
-                page_w, page_h = PAPER_SIZES_PT[paper_key]
-                if orientation == "Landscape":
-                    page_w, page_h = page_h, page_w
+                groups = group_sheets_by_signature(st.session_state.regions_df)
+                incomplete_flags = find_incomplete_sheets(groups)
+                for f in incomplete_flags:
+                    missing_str = ", ".join(f"{k}: {t}" for k, t in f["missing"])
+                    st.warning(
+                        f"Sheet(s) {_format_page_ranges(f['pages'])} look like they belong with "
+                        f"Group {f['closest_group_id']} but are missing: {missing_str}. They'll "
+                        "only export whatever was actually detected on them."
+                    )
 
-                template_rows = _dedupe_rows_by_name(selected_rows)
+                group_cache = _load_cache()
+                group_cache_entry = group_cache.setdefault(st.session_state.pdf_hash, {})
+                group_selections = group_cache_entry.setdefault("group_selections", {})
 
-                selection_key = tuple((r["Kind"], r["Title"]) for r in template_rows)
-                if st.session_state.canvas_selection_key != selection_key:
-                    initial, order = build_canvas_initial_layout(template_rows, page_w, page_h, margin, spacing)
-                    st.session_state.canvas_initial = initial
-                    st.session_state.canvas_region_order = order
-                    st.session_state.canvas_selection_key = selection_key
+                for g in groups:
+                    sig_sorted = sorted(g["signature"])
+                    saved = {tuple(x) for x in group_selections.get(g["key"], [])}
+                    with st.container(border=True):
+                        st.markdown(f"**Group {g['id']}** -- {len(g['pages'])} sheet(s) "
+                                    f"(page {_format_page_ranges(g['pages'])})")
+                        n_cols = min(len(sig_sorted), 4) or 1
+                        cols = st.columns(n_cols)
+                        checked = set()
+                        for i, (kind, title) in enumerate(sig_sorted):
+                            default = (kind, title) in saved
+                            val = cols[i % n_cols].checkbox(
+                                f"{kind}: {title}", value=default, key=f"grp_{g['key']}_{kind}_{title}"
+                            )
+                            if val:
+                                checked.add((kind, title))
 
-                arrange_col1, arrange_col2, arrange_col3, arrange_col4 = st.columns([1.3, 0.8, 0.8, 1.1])
-                with arrange_col1:
-                    if st.button("↺ Reset to auto-packed"):
+                    df = st.session_state.regions_df
+                    mask = df["Page"].astype(int).isin(g["pages"])
+                    for kind, title in sig_sorted:
+                        row_mask = mask & (df["Kind"] == kind) & (df["Title"] == title)
+                        df.loc[row_mask, "Include"] = (kind, title) in checked
+                    st.session_state.regions_df = df
+                    group_selections[g["key"]] = [list(t) for t in checked]
+
+                group_cache[st.session_state.pdf_hash] = group_cache_entry
+                _save_cache(group_cache)
+
+                st.divider()
+
+                with st.expander("Fine-tune individual detections (advanced)"):
+                    st.caption(
+                        "Per-sheet detail, for the rare case a detection box or title needs a manual "
+                        "correction. Titles and box coordinates (in PDF points, top-left origin) are "
+                        "editable, and you can add or delete rows. Note: the Include checkbox here is "
+                        "normally driven by the Sheet Groups selections above -- toggling it manually is "
+                        "only a temporary override and will be replaced the next time a group checkbox "
+                        "changes or a Select All/Deselect All button runs."
+                    )
+                    colored_legend = " &nbsp; ".join(
+                        f'<span style="color:rgb{c}">■</span> {k}' for k, c in KIND_COLORS.items()
+                    )
+                    st.markdown(colored_legend, unsafe_allow_html=True)
+
+                    edited = st.data_editor(
+                        st.session_state.regions_df,
+                        column_config={
+                            "Include": st.column_config.CheckboxColumn("Include", default=False),
+                            "Page": st.column_config.NumberColumn("Page", min_value=1, max_value=n_pages, step=1),
+                            "Kind": st.column_config.SelectboxColumn("Kind", options=["Schedule", "View", "Notes"]),
+                            "Title": st.column_config.TextColumn("Title", width="medium"),
+                            "X0": st.column_config.NumberColumn("X0", format="%.1f"),
+                            "Y0": st.column_config.NumberColumn("Y0", format="%.1f"),
+                            "X1": st.column_config.NumberColumn("X1", format="%.1f"),
+                            "Y1": st.column_config.NumberColumn("Y1", format="%.1f"),
+                        },
+                        num_rows="dynamic",
+                        use_container_width=True,
+                        key="editor_regions",
+                    )
+                    st.session_state.regions_df = edited
+                    _persist_current_state()
+
+                    col_a, col_b, col_c, _ = st.columns([1, 1, 1.6, 2.4])
+                    with col_a:
+                        if st.button("Select All"):
+                            st.session_state.regions_df["Include"] = True
+                            _persist_current_state()
+                            st.rerun()
+                    with col_b:
+                        if st.button("Deselect All"):
+                            st.session_state.regions_df["Include"] = False
+                            _persist_current_state()
+                            st.rerun()
+                    with col_c:
+                        if st.button("Forget saved checks for this file"):
+                            cache = _load_cache()
+                            cache.pop(st.session_state.pdf_hash, None)
+                            _save_cache(cache)
+                            st.session_state.regions_df["Include"] = False
+                            st.rerun()
+
+                st.divider()
+                selected = st.session_state.regions_df[st.session_state.regions_df["Include"] == True]
+                st.write(f"**{len(selected)}** region(s) selected for export.")
+                selected_sorted = selected.sort_values(by=["Page", "Y0", "X0"])
+                selected_rows = selected_sorted.to_dict("records")
+
+                manual_dest_list = None
+                if manual_layout and not selected.empty:
+                    st.subheader("Layout Editor")
+                    st.caption(
+                        "Design the layout once, per named view/schedule -- drag an item to "
+                        "reposition it and drag a corner handle to resize it (hold Shift to keep "
+                        "proportions), or pick a column x row grid below and click Apply. This same "
+                        f"layout is then repeated as its own {paper_key.split(' ')[0]} "
+                        f"{orientation.lower()} output page for every sheet that has these items -- "
+                        "the light grey guide shows your margin."
+                    )
+
+                    page_w, page_h = PAPER_SIZES_PT[paper_key]
+                    if orientation == "Landscape":
+                        page_w, page_h = page_h, page_w
+
+                    template_rows = _dedupe_rows_by_name(selected_rows)
+
+                    selection_key = tuple((r["Kind"], r["Title"]) for r in template_rows)
+                    if st.session_state.canvas_selection_key != selection_key:
                         initial, order = build_canvas_initial_layout(template_rows, page_w, page_h, margin, spacing)
                         st.session_state.canvas_initial = initial
                         st.session_state.canvas_region_order = order
-                with arrange_col2:
-                    grid_cols = st.number_input("Columns", min_value=1, max_value=8, value=2, step=1, key="grid_cols")
-                with arrange_col3:
-                    grid_rows = st.number_input("Rows", min_value=1, max_value=8, value=1, step=1, key="grid_rows")
-                with arrange_col4:
-                    st.write("")  # vertical spacer to align button with the number inputs
-                    if st.button(f"⊞ Apply {int(grid_cols)}x{int(grid_rows)} grid"):
-                        initial, order = build_grid_initial_layout(
-                            template_rows, page_w, page_h, margin, spacing, grid_cols, grid_rows)
-                        st.session_state.canvas_initial = initial
-                        st.session_state.canvas_region_order = order
-                        if len(template_rows) > grid_cols * grid_rows:
-                            st.info(f"{len(template_rows)} named item(s) don't fit a "
-                                    f"{int(grid_cols)}x{int(grid_rows)} grid -- added extra row(s) "
-                                    "so nothing was left out.")
+                        st.session_state.canvas_selection_key = selection_key
 
-                cw, ch = _canvas_dims(page_w, page_h)
-                canvas_scale = cw / page_w
-                margin_guide = Image.new("RGB", (int(cw), int(ch)), "white")
-                gd = ImageDraw.Draw(margin_guide)
-                gd.rectangle(
-                    (margin * canvas_scale, margin * canvas_scale,
-                     cw - margin * canvas_scale, ch - margin * canvas_scale),
-                    outline=(210, 210, 210),
-                )
+                    arrange_col1, arrange_col2, arrange_col3, arrange_col4 = st.columns([1.3, 0.8, 0.8, 1.1])
+                    with arrange_col1:
+                        if st.button("↺ Reset to auto-packed"):
+                            initial, order = build_canvas_initial_layout(template_rows, page_w, page_h, margin, spacing)
+                            st.session_state.canvas_initial = initial
+                            st.session_state.canvas_region_order = order
+                    with arrange_col2:
+                        grid_cols = st.number_input("Columns", min_value=1, max_value=8, value=2, step=1, key="grid_cols")
+                    with arrange_col3:
+                        grid_rows = st.number_input("Rows", min_value=1, max_value=8, value=1, step=1, key="grid_rows")
+                    with arrange_col4:
+                        st.write("")  # vertical spacer to align button with the number inputs
+                        if st.button(f"⊞ Apply {int(grid_cols)}x{int(grid_rows)} grid"):
+                            initial, order = build_grid_initial_layout(
+                                template_rows, page_w, page_h, margin, spacing, grid_cols, grid_rows)
+                            st.session_state.canvas_initial = initial
+                            st.session_state.canvas_region_order = order
+                            if len(template_rows) > grid_cols * grid_rows:
+                                st.info(f"{len(template_rows)} named item(s) don't fit a "
+                                        f"{int(grid_cols)}x{int(grid_rows)} grid -- added extra row(s) "
+                                        "so nothing was left out.")
 
-                canvas_result = st_canvas(
-                    fill_color="rgba(46, 96, 166, 0.15)",
-                    stroke_width=2,
-                    stroke_color="#2e60a6",
-                    background_image=margin_guide,
-                    update_streamlit=True,
-                    height=int(ch), width=int(cw),
-                    drawing_mode="transform",
-                    initial_drawing=st.session_state.canvas_initial,
-                    key="layout_canvas",
-                )
+                    cw, ch = _canvas_dims(page_w, page_h)
+                    canvas_scale = cw / page_w
+                    margin_guide = Image.new("RGB", (int(cw), int(ch)), "white")
+                    gd = ImageDraw.Draw(margin_guide)
+                    gd.rectangle(
+                        (margin * canvas_scale, margin * canvas_scale,
+                         cw - margin * canvas_scale, ch - margin * canvas_scale),
+                        outline=(210, 210, 210),
+                    )
 
-                if canvas_result.json_data is not None:
-                    objs = canvas_result.json_data.get("objects", [])
-                    if len(objs) == len(st.session_state.canvas_region_order):
-                        manual_dest_list = canvas_objects_to_dest(objs, page_w, page_h)
-                    else:
-                        st.warning("Layout editor is out of sync with the current selection -- "
-                                   "click 'Reset layout to auto-packed' above.")
+                    canvas_result = st_canvas(
+                        fill_color="rgba(46, 96, 166, 0.15)",
+                        stroke_width=2,
+                        stroke_color="#2e60a6",
+                        background_image=margin_guide,
+                        update_streamlit=True,
+                        height=int(ch), width=int(cw),
+                        drawing_mode="transform",
+                        initial_drawing=st.session_state.canvas_initial,
+                        key="layout_canvas",
+                    )
 
-            gen_disabled = selected.empty or (manual_layout and manual_dest_list is None)
-            if st.button("📤 Generate PDF", type="primary", use_container_width=True, disabled=gen_disabled):
-                with st.spinner("Building output PDF..."):
-                    try:
-                        footer_fields = {
-                            "project_name": st.session_state.project_name.strip(),
-                            "drawing_name": st.session_state.drawing_name.strip(),
-                            "drawing_no": st.session_state.drawing_no.strip(),
-                        }
-                        if manual_layout and manual_dest_list is not None:
-                            # manual_dest_list has one dest rect per distinct
-                            # (Kind, Title) name, in canvas_region_order. Repeat
-                            # that same template as one output page per sheet,
-                            # each sheet contributing its own region for
-                            # whichever names it actually has.
-                            dest_by_name = {
-                                (o[1], o[2]): dest
-                                for o, dest in zip(st.session_state.canvas_region_order, manual_dest_list)
-                            }
-                            manual_dest_by_sheet = {}
-                            for sheet_regions in _group_by_sheet(selected_rows):
-                                sheet_page = int(sheet_regions[0]["Page"])
-                                pairs = [
-                                    (r, dest_by_name[(r["Kind"], r["Title"])])
-                                    for r in sheet_regions
-                                    if (r["Kind"], r["Title"]) in dest_by_name
-                                ]
-                                if pairs:
-                                    manual_dest_by_sheet[sheet_page] = pairs
-                            out_bytes = build_output_pdf(
-                                st.session_state.pdf_bytes, None,
-                                paper_key, orientation, margin=margin, spacing=spacing,
-                                footer_fields=footer_fields, manual_dest=manual_dest_by_sheet,
-                            )
+                    if canvas_result.json_data is not None:
+                        objs = canvas_result.json_data.get("objects", [])
+                        if len(objs) == len(st.session_state.canvas_region_order):
+                            manual_dest_list = canvas_objects_to_dest(objs, page_w, page_h)
                         else:
-                            out_bytes = build_output_pdf(
-                                st.session_state.pdf_bytes, selected_rows,
-                                paper_key, orientation, margin=margin, spacing=spacing,
-                                footer_fields=footer_fields,
+                            st.warning("Layout editor is out of sync with the current selection -- "
+                                       "click 'Reset layout to auto-packed' above.")
+
+                gen_disabled = selected.empty or (manual_layout and manual_dest_list is None)
+                if st.button("📤 Generate PDF", type="primary", use_container_width=True, disabled=gen_disabled):
+                    with st.spinner("Building output PDF..."):
+                        try:
+                            footer_fields = {
+                                "project_name": st.session_state.project_name.strip(),
+                                "drawing_name": st.session_state.drawing_name.strip(),
+                                "drawing_no": st.session_state.drawing_no.strip(),
+                            }
+                            if manual_layout and manual_dest_list is not None:
+                                # manual_dest_list has one dest rect per distinct
+                                # (Kind, Title) name, in canvas_region_order. Repeat
+                                # that same template as one output page per sheet,
+                                # each sheet contributing its own region for
+                                # whichever names it actually has.
+                                dest_by_name = {
+                                    (o[1], o[2]): dest
+                                    for o, dest in zip(st.session_state.canvas_region_order, manual_dest_list)
+                                }
+                                manual_dest_by_sheet = {}
+                                for sheet_regions in _group_by_sheet(selected_rows):
+                                    sheet_page = int(sheet_regions[0]["Page"])
+                                    pairs = [
+                                        (r, dest_by_name[(r["Kind"], r["Title"])])
+                                        for r in sheet_regions
+                                        if (r["Kind"], r["Title"]) in dest_by_name
+                                    ]
+                                    if pairs:
+                                        manual_dest_by_sheet[sheet_page] = pairs
+                                out_bytes = build_output_pdf(
+                                    st.session_state.pdf_bytes, None,
+                                    paper_key, orientation, margin=margin, spacing=spacing,
+                                    footer_fields=footer_fields, manual_dest=manual_dest_by_sheet,
+                                )
+                            else:
+                                out_bytes = build_output_pdf(
+                                    st.session_state.pdf_bytes, selected_rows,
+                                    paper_key, orientation, margin=margin, spacing=spacing,
+                                    footer_fields=footer_fields,
+                                )
+                            base = os.path.splitext(st.session_state.pdf_name or "sheet")[0]
+                            mode_tag = "MANUAL" if manual_layout else "SQUEEZE"
+                            out_name = f"{base}_SELECTED_{paper_key.split(' ')[0]}_{orientation}_{mode_tag}.pdf"
+                            with pymupdf.open(stream=out_bytes, filetype="pdf") as _chk:
+                                n_out_pages = len(_chk)
+                            st.success(f"Done! ({n_out_pages} page{'s' if n_out_pages != 1 else ''})")
+                            st.download_button(
+                                "⬇️ Download Exported PDF", data=out_bytes,
+                                file_name=out_name, mime="application/pdf",
+                                use_container_width=True,
                             )
-                        base = os.path.splitext(st.session_state.pdf_name or "sheet")[0]
-                        mode_tag = "MANUAL" if manual_layout else "SQUEEZE"
-                        out_name = f"{base}_SELECTED_{paper_key.split(' ')[0]}_{orientation}_{mode_tag}.pdf"
-                        with pymupdf.open(stream=out_bytes, filetype="pdf") as _chk:
-                            n_out_pages = len(_chk)
-                        st.success(f"Done! ({n_out_pages} page{'s' if n_out_pages != 1 else ''})")
-                        st.download_button(
-                            "⬇️ Download Exported PDF", data=out_bytes,
-                            file_name=out_name, mime="application/pdf",
-                            use_container_width=True,
-                        )
-                    except Exception as e:
-                        st.error(f"Export failed: {type(e).__name__}: {e}")
-                        with st.expander("Details"):
-                            st.code(traceback.format_exc())
-else:
-    st.info("Upload a PDF to get started.")
+                        except Exception as e:
+                            st.error(f"Export failed: {type(e).__name__}: {e}")
+                            with st.expander("Details"):
+                                st.code(traceback.format_exc())
+    else:
+        st.info("Upload a PDF to get started.")
