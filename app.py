@@ -19,6 +19,7 @@ the preview -- nothing is locked in until you click Generate.
 Run with:  streamlit run sheet_region_exporter.py
 """
 
+import concurrent.futures
 import hashlib
 import io
 import json
@@ -181,13 +182,16 @@ def _group_words_into_segments(words, y_tol=2, x_gap=40):
     return out
 
 
-def _extend_bbox_to_trailing_rows(page_pl, bbox, max_gap=18, max_iter=6):
+def _extend_bbox_to_trailing_rows(words, bbox, max_gap=18, max_iter=6):
     """Some Revit-exported schedules have a final data row with no ruling
     lines below it, so pdfplumber's ruled-table detection clips it off.
     Walk downward picking up any word lines that are clearly a continuation
-    (same x-range, small vertical gap) of the table."""
+    (same x-range, small vertical gap) of the table. Takes the page's
+    already-extracted word list (see detect_regions_on_page) instead of
+    re-running extract_words() itself -- that call is the single slowest
+    step in detection and this function used to trigger it a second time
+    on every single schedule found on a page."""
     x0, y0, x1, y1 = bbox
-    words = page_pl.extract_words()
     for _ in range(max_iter):
         cand = [w for w in words
                 if 0 <= (w["top"] - y1) <= max_gap
@@ -201,7 +205,7 @@ def _extend_bbox_to_trailing_rows(page_pl, bbox, max_gap=18, max_iter=6):
     return (x0, y0, x1, y1)
 
 
-def _detect_schedules(page_pl, page_area):
+def _detect_schedules(page_pl, page_area, words):
     """Detect ruled tables that look like real schedules (not stray
     dimension-line crossings or the title block)."""
     schedules = []
@@ -237,14 +241,13 @@ def _detect_schedules(page_pl, page_area):
         title = None
         if data and data[0][0] and all((c is None or not str(c).strip()) for c in data[0][1:]):
             title = str(data[0][0]).replace("\n", " ").strip()
-        extended_bbox = _extend_bbox_to_trailing_rows(page_pl, (x0, y0, x1, y1))
+        extended_bbox = _extend_bbox_to_trailing_rows(words, (x0, y0, x1, y1))
         schedules.append({"bbox": extended_bbox, "title": title or "Schedule"})
 
     return schedules
 
 
-def _detect_notes(page_pl, schedules, page_h):
-    words = page_pl.extract_words()
+def _detect_notes(words, schedules, page_h):
     notes_top = notes_x0 = None
     for w in words:
         if w["text"].upper().startswith("NOTE"):
@@ -265,8 +268,7 @@ def _detect_notes(page_pl, schedules, page_h):
     )
 
 
-def _detect_view_captions(page_pl, schedules, notes_bbox):
-    words = page_pl.extract_words()
+def _detect_view_captions(words, schedules, notes_bbox):
     segs = _group_words_into_segments(words)
     scale_segs = [s for s in segs if SCALE_RE.search(s[0])]
     other_segs = [s for s in segs if not SCALE_RE.search(s[0])]
@@ -390,9 +392,16 @@ def detect_regions_on_page(page_pl, page_mu, page_index):
     """Returns a list of region dicts for one page: kind/title/bbox."""
     page_area = page_pl.width * page_pl.height
 
-    schedules = _detect_schedules(page_pl, page_area)
-    notes_bbox = _detect_notes(page_pl, schedules, page_pl.height)
-    views = _detect_view_captions(page_pl, schedules, notes_bbox)
+    # extract_words() re-derives word groupings from every char on the page
+    # and is by far the most expensive single call in detection on a
+    # vector/text-dense Revit sheet -- do it exactly once per page and hand
+    # the same list to every detector below instead of each one re-parsing
+    # the page's text independently (this used to happen 2-3x per page).
+    words = page_pl.extract_words()
+
+    schedules = _detect_schedules(page_pl, page_area, words)
+    notes_bbox = _detect_notes(words, schedules, page_pl.height)
+    views = _detect_view_captions(words, schedules, notes_bbox)
 
     exclude = [s["bbox"] for s in schedules]
     if notes_bbox:
@@ -460,37 +469,75 @@ def detect_regions_on_page(page_pl, page_mu, page_index):
     return regions
 
 
-def detect_all_pages(pdf_bytes, page_numbers, on_progress=None):
+def _detect_one_page_worker(pdf_bytes, page_number):
+    """Runs detection for exactly one page. Opens its own pdfplumber/PyMuPDF
+    handles (rather than sharing one across a whole batch) so this can be
+    called safely from multiple threads at once -- see detect_all_pages.
+    Returns (page_number, regions, error_message_or_None)."""
+    idx = page_number - 1
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_pl:
+            page_pl = pdf_pl.pages[idx]
+            doc_mu = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                page_mu = doc_mu[idx]
+                regions = detect_regions_on_page(page_pl, page_mu, idx)
+            finally:
+                doc_mu.close()
+                page_pl.close()
+        return page_number, regions, None
+    except Exception as e:
+        return page_number, [], f"{type(e).__name__}: {e}"
+
+
+def detect_all_pages(pdf_bytes, page_numbers, on_progress=None,
+                      page_cache=None, force_rescan=False, max_workers=None):
     """page_numbers is a 1-indexed list of pages to scan.
 
-    Returns (all_regions, errors) -- errors is a list of (page_number, message)
-    for any page that failed, so one bad sheet doesn't sink a whole batch.
+    Scans pages concurrently (via a thread pool) instead of one at a time.
+    pdfplumber/pdf parsing releases Python's GIL for a meaningful chunk of
+    its work (and the raster/connected-component step in
+    _find_drawing_blobs is pure numpy/scipy, which releases it entirely),
+    so on a multi-core machine this cuts wall-clock time roughly in
+    proportion to available cores for a 70+ sheet batch.
+
+    page_cache, if given, is a {page_number_str: [region dict, ...]} map of
+    already-detected pages from a previous run of this same file (see the
+    on-disk cache) -- those pages are reused instead of re-scanned unless
+    force_rescan is True. Returns (all_regions, errors, updated_page_cache).
     """
+    page_cache = dict(page_cache or {})
     all_regions = []
     errors = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_pl:
-        doc_mu = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        for i, pno in enumerate(page_numbers):
-            idx = pno - 1
-            page_pl = pdf_pl.pages[idx]
-            page_mu = doc_mu[idx]
-            try:
-                all_regions.extend(detect_regions_on_page(page_pl, page_mu, idx))
-            except Exception as e:
-                errors.append((pno, f"{type(e).__name__}: {e}"))
-            finally:
-                # pdfplumber caches every char/line/rect/curve it parses on
-                # the Page object itself and never lets go of it on its own;
-                # pdf_pl.pages keeps all of them alive for the life of this
-                # "with" block, so on a vector-heavy (Revit-exported) sheet a
-                # batch of 70+ pages can pile up gigabytes of cached geometry
-                # and get the whole app OOM-killed. Flush each page's cache
-                # as soon as we're done with it.
-                page_pl.close()
-            if on_progress:
-                on_progress(i + 1, len(page_numbers))
-        doc_mu.close()
-    return all_regions, errors
+    to_scan = []
+    for pno in page_numbers:
+        key = str(pno)
+        if not force_rescan and key in page_cache:
+            all_regions.extend(page_cache[key])
+        else:
+            to_scan.append(pno)
+
+    total = len(page_numbers)
+    done = len(page_numbers) - len(to_scan)
+    if on_progress:
+        on_progress(done, total)
+
+    if to_scan:
+        max_workers = max_workers or min(32, (os.cpu_count() or 4) * 2, len(to_scan))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_detect_one_page_worker, pdf_bytes, pno): pno for pno in to_scan}
+            for future in concurrent.futures.as_completed(futures):
+                pno, regions, err = future.result()
+                if err:
+                    errors.append((pno, err))
+                else:
+                    page_cache[str(pno)] = regions
+                    all_regions.extend(regions)
+                done += 1
+                if on_progress:
+                    on_progress(done, total)
+
+    return all_regions, errors, page_cache
 
 
 # ============================================================
@@ -1155,6 +1202,15 @@ if st.session_state.pdf_bytes is not None:
                 st.error(str(e))
                 pages_to_scan = []
 
+        force_rescan = st.checkbox(
+            "Force re-scan (ignore cached results from a previous Detect run)",
+            value=False,
+            help="Detection results are cached per page for this file. Leave this unchecked "
+                 "to re-run Detect quickly after only changing the page range above -- "
+                 "already-scanned pages are reused instead of re-processed. Check this if "
+                 "you've edited the PDF itself, or want to redo detection from scratch.",
+        )
+
         if st.button("🔍 Detect Schedules / Views / Notes", type="primary", disabled=not pages_to_scan):
             progress_bar = st.progress(0.0, text=f"Scanning 0/{len(pages_to_scan)} sheet(s)...")
 
@@ -1162,12 +1218,25 @@ if st.session_state.pdf_bytes is not None:
                 progress_bar.progress(done / total, text=f"Scanning {done}/{total} sheet(s)...")
 
             try:
-                regions, page_errors = detect_all_pages(
-                    st.session_state.pdf_bytes, pages_to_scan, on_progress=_report_progress
+                cache = _load_cache()
+                entry = cache.get(st.session_state.pdf_hash, {})
+                page_cache = entry.get("page_regions", {})
+                n_cached_before = sum(1 for pno in pages_to_scan if str(pno) in page_cache) if not force_rescan else 0
+
+                regions, page_errors, updated_page_cache = detect_all_pages(
+                    st.session_state.pdf_bytes, pages_to_scan,
+                    on_progress=_report_progress, page_cache=page_cache, force_rescan=force_rescan,
                 )
                 progress_bar.empty()
+
+                # persist the (now larger) per-page detection cache
                 cache = _load_cache()
-                saved_includes = cache.get(st.session_state.pdf_hash, {}).get("regions", {})
+                entry = cache.setdefault(st.session_state.pdf_hash, {})
+                entry["page_regions"] = updated_page_cache
+                cache[st.session_state.pdf_hash] = entry
+                _save_cache(cache)
+
+                saved_includes = entry.get("regions", {})
                 rows = [{
                     "Include": bool(saved_includes.get(
                         _region_key(r["page"] + 1, r["kind"], r["title"]), False)),
@@ -1175,6 +1244,10 @@ if st.session_state.pdf_bytes is not None:
                     "X0": round(r["bbox"][0], 1), "Y0": round(r["bbox"][1], 1),
                     "X1": round(r["bbox"][2], 1), "Y1": round(r["bbox"][3], 1),
                 } for r in regions]
+                # pages now finish scanning in whatever order threads complete
+                # them, not the order they were requested in -- restore
+                # reading order (page, then top-to-bottom, then left-to-right)
+                rows.sort(key=lambda r: (r["Page"], round(r["Y0"] / 40), r["X0"]))
                 st.session_state.regions_df = pd.DataFrame(rows)
                 st.session_state.detected = True
                 if page_errors:
@@ -1187,10 +1260,13 @@ if st.session_state.pdf_bytes is not None:
                                "You can still add regions manually in the table below.")
                 else:
                     n_restored = sum(1 for r in rows if r["Include"])
-                    msg = f"Found {len(rows)} region(s), all unchecked by default."
+                    msg = f"Found {len(rows)} region(s)"
+                    if n_cached_before:
+                        msg += f" -- reused cached results for {n_cached_before} already-scanned page(s)"
+                    msg += ", all unchecked by default." if not n_restored else "."
                     if n_restored:
-                        msg = (f"Found {len(rows)} region(s) -- restored {n_restored} "
-                               f"checkmark(s) you'd saved for this file previously.")
+                        msg += (f" Restored {n_restored} checkmark(s) you'd saved for this "
+                                "file previously.")
                     st.success(msg)
             except Exception as e:
                 progress_bar.empty()
