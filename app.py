@@ -1,6 +1,6 @@
 """
 Sheet Region Exporter
-======================
+=======================
 Reads a drawing sheet PDF (Revit-exported or similar), auto-detects the
 schedules (tables), views (drafting-view drawings w/ title + scale callout),
 and general notes block on each page, lists them in reading order with a
