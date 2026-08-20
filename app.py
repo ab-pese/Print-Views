@@ -978,6 +978,48 @@ def _format_page_ranges(pages):
 
 
 # ============================================================
+# Page-range spec parsing (text box: "all", "2-71", "2-10, 13-15")
+# ============================================================
+def parse_page_range_spec(spec, n_pages):
+    """Parses a page-range string into a sorted, de-duplicated list of valid
+    page numbers (1-indexed). Accepts:
+      - "all" (or blank) -> every page
+      - a single range: "2-71"
+      - a comma-separated mix of single pages and ranges: "2-10, 13-15, 20"
+    Raises ValueError with a user-facing message on malformed input or
+    out-of-range page numbers."""
+    spec = (spec or "").strip()
+    if not spec or spec.lower() == "all":
+        return list(range(1, n_pages + 1))
+
+    pages = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            bounds = part.split("-")
+            if len(bounds) != 2 or not all(b.strip().isdigit() for b in bounds):
+                raise ValueError(f"Couldn't parse range '{part}'. Use a format like 2-10.")
+            a, b = int(bounds[0].strip()), int(bounds[1].strip())
+            if a > b:
+                a, b = b, a
+            pages.update(range(a, b + 1))
+        elif part.isdigit():
+            pages.add(int(part))
+        else:
+            raise ValueError(f"Couldn't parse '{part}'. Use a page number or a range like 2-10.")
+
+    out_of_range = sorted(p for p in pages if p < 1 or p > n_pages)
+    if out_of_range:
+        raise ValueError(
+            f"Page(s) {', '.join(str(p) for p in out_of_range)} are out of range -- "
+            f"this PDF only has {n_pages} page(s)."
+        )
+    return sorted(pages)
+
+
+# ============================================================
 # UI
 # ============================================================
 st.title("📐 Sheet Region Exporter")
@@ -1093,12 +1135,27 @@ if st.session_state.pdf_bytes is not None:
     _persist_current_state()
 
     if n_pages:
-        page_choices = list(range(1, n_pages + 1))
-        pages_to_scan = page_choices if n_pages == 1 else st.multiselect(
-            "Pages to scan", page_choices, default=page_choices
-        )
+        if n_pages == 1:
+            pages_to_scan = [1]
+        else:
+            page_spec = st.text_input(
+                "Pages to scan",
+                value="all",
+                help="Type 'all' to scan every page, a single range like 2-71, "
+                     "or a comma-separated mix of pages/ranges like 2-10, 13-15.",
+            )
+            try:
+                pages_to_scan = parse_page_range_spec(page_spec, n_pages)
+                if not pages_to_scan:
+                    st.warning("No pages selected -- type 'all' or a range like 2-71.")
+                else:
+                    st.caption(f"Will scan {len(pages_to_scan)} page(s): "
+                               f"{_format_page_ranges(pages_to_scan)}")
+            except ValueError as e:
+                st.error(str(e))
+                pages_to_scan = []
 
-        if st.button("🔍 Detect Schedules / Views / Notes", type="primary"):
+        if st.button("🔍 Detect Schedules / Views / Notes", type="primary", disabled=not pages_to_scan):
             progress_bar = st.progress(0.0, text=f"Scanning 0/{len(pages_to_scan)} sheet(s)...")
 
             def _report_progress(done, total):
